@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+.venv-build/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+release/
+*.spec.bak
+settings.json
+operation_history.jsonl
+.DS_Store
+Thumbs.db
+
