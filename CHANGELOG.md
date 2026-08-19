@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2 - 2026-08-19
+
+- 修复 Windows EXE 启动时出现“attempted relative import with no known parent package”的问题。
+- PyInstaller 改为使用项目顶层启动器，冻结环境不再依赖源码目录结构。
+- 包内 `__main__` 改用绝对导入，并增加两种启动入口的回归测试。
+- GitHub Actions 和本地构建脚本会实际启动打包后的 EXE 执行无界面自检，异常产物不再上传。
+- 修正文档中的当前维护版本。
+- 自动化测试扩充到 58 项。
+
 ## 1.2.1 - 2026-08-19
 
 - 扫描结果表增加视频编码与 MD5 状态列。

@@ -91,7 +91,7 @@ Windows 上安装 Python 3.8 后，双击 `build_windows.bat`。脚本会自动�
 
 ```text
 dist\MediaDupFinder.exe
-release\MediaDupFinder-v1.2.1-Windows-x64.zip
+release\MediaDupFinder-v1.2.2-Windows-x64.zip
 ```
 
 PyInstaller 不是交叉编译器，因此 Windows EXE 必须在 Windows 或 GitHub 的 Windows Runner 上生成。完整说明见 [Windows 构建与发布](docs/WINDOWS_BUILD.md)。
@@ -103,13 +103,13 @@ PyInstaller 不是交叉编译器，因此 Windows EXE 必须在 Windows 或 Git
 1. 把整个项目推送到 GitHub 的 `main` 分支。
 2. 打开仓库的 **Actions** 页面，可手动运行 **Build Windows releases**。
 3. 每次推送都会生成 x64、x86 两个可下载的工作流产物。
-4. 创建并推送 `v1.2.1` 标签时，工作流还会自动创建 GitHub Release 并附上两个 ZIP。
+4. 创建并推送 `v1.2.2` 标签时，工作流还会自动创建 GitHub Release 并附上两个 ZIP。
 
 示例命令：
 
 ```bash
-git tag v1.2.1
-git push origin v1.2.1
+git tag v1.2.2
+git push origin v1.2.2
 ```
 
 ## 识别逻辑概览

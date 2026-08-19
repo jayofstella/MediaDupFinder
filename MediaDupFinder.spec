@@ -7,7 +7,7 @@ project_root = Path(SPECPATH)
 source_root = project_root / "src"
 
 a = Analysis(
-    [str(source_root / "media_dup_finder" / "__main__.py")],
+    [str(project_root / "MediaDupFinder.pyw")],
     pathex=[str(source_root)],
     binaries=[],
     datas=[(str(project_root / "resources" / "icon.ico"), ".")],

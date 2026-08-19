@@ -32,6 +32,10 @@ echo [4/5] Building Windows executable...
 python -m PyInstaller --clean --noconfirm MediaDupFinder.spec
 if errorlevel 1 goto :failed
 
+echo Verifying packaged executable startup...
+start "" /wait "%CD%\dist\MediaDupFinder.exe" --startup-check
+if errorlevel 1 goto :failed
+
 for /f %%A in ('python -c "import struct; print('x64' if struct.calcsize('P') == 8 else 'x86')"') do set "MDF_ARCH=%%A"
 echo [5/5] Creating release ZIP...
 python scripts\package_release.py --arch %MDF_ARCH%
@@ -40,7 +44,7 @@ if errorlevel 1 goto :failed
 echo.
 echo Build completed successfully.
 echo EXE: %CD%\dist\MediaDupFinder.exe
-echo ZIP: %CD%\release\MediaDupFinder-v1.2.1-Windows-%MDF_ARCH%.zip
+echo ZIP: %CD%\release\MediaDupFinder-v1.2.2-Windows-%MDF_ARCH%.zip
 pause
 exit /b 0
 

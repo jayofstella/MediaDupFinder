@@ -43,6 +43,14 @@ jobs:
       - name: Build executable
         run: python -m PyInstaller --clean --noconfirm MediaDupFinder.spec
 
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath ".\dist\MediaDupFinder.exe" -ArgumentList "--startup-check" -PassThru -Wait
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged executable startup check failed with exit code $($process.ExitCode)"
+          }
+
       - name: Package release ZIP
         run: python scripts/package_release.py --arch ${{ matrix.architecture }}
 
