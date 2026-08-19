@@ -34,7 +34,12 @@ class LocationTests(unittest.TestCase):
                 [str(first), str(first / "."), str(second), str(second)],
                 existing=[str(first)],
             )
-            self.assertEqual(result, [str(second.resolve())])
+            self.assertEqual(len(result), 1)
+            # Windows may expose the same temporary directory through an 8.3
+            # short path (RUNNER~1) while Path.resolve() expands it to the long
+            # name (runneradmin). Compare the actual directory identity instead
+            # of requiring those two valid spellings to be textually identical.
+            self.assertTrue(Path(result[0]).samefile(second))
 
 
 if __name__ == "__main__":

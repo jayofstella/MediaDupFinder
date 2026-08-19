@@ -15,12 +15,12 @@ VSVersionInfo(
         '080404b0',
         [StringStruct('CompanyName', 'MediaDupFinder contributors'),
          StringStruct('FileDescription', '影视作品去重助手'),
-         StringStruct('FileVersion', '1.5.0'),
+         StringStruct('FileVersion', '1.5.1'),
          StringStruct('InternalName', 'MediaDupFinder'),
          StringStruct('LegalCopyright', 'MIT License'),
          StringStruct('OriginalFilename', 'MediaDupFinder.exe'),
          StringStruct('ProductName', '影视作品去重助手'),
-         StringStruct('ProductVersion', '1.5.0')])
+         StringStruct('ProductVersion', '1.5.1')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]
