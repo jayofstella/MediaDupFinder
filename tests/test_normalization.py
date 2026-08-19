@@ -80,6 +80,49 @@ class NormalizationTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertEqual(normalize_filename(filename).catalog_key, expected)
 
+    def test_dated_series_episode_is_a_work_identity_not_a_catalog(self) -> None:
+        info = normalize_filename("brothalovers.15.07.28.lynna.nilsson.mp4")
+        self.assertIsNone(info.catalog_key)
+        self.assertEqual(info.identity_kind, "dated_episode")
+        self.assertEqual(info.series_key, "brothalovers")
+        self.assertEqual(info.episode_date, "2015-07-28")
+        self.assertIn("lynna", info.work_key)
+
+    def test_numeric_suffix_after_catalog_is_a_part_marker(self) -> None:
+        self.assertEqual(normalize_filename("kavr-253-2.mp4").catalog_key, "kavr-253")
+        self.assertEqual(normalize_filename("kavr-253-2.mp4").part_marker, "part2")
+        self.assertEqual(normalize_filename("kavr-253-8.mp4").part_marker, "part8")
+
+    def test_letter_suffix_after_catalog_can_be_a_segment(self) -> None:
+        self.assertEqual(normalize_filename("kavr-253-A.mp4").part_marker, "segment:A")
+        self.assertEqual(normalize_filename("kavr-253-B.mp4").part_marker, "segment:B")
+        self.assertIsNone(normalize_filename("MIDA-630-C.mp4").part_marker)
+
+    def test_season_episode_is_a_structured_work_identity(self) -> None:
+        info = normalize_filename("The.Show.S02E07.1080p.mkv")
+        self.assertEqual(info.identity_kind, "series_episode")
+        self.assertEqual(info.series_key, "theshow")
+        self.assertEqual(info.episode_id, "s02e07")
+
+    def test_episode_only_and_chinese_episode_are_structured_identities(self) -> None:
+        english = normalize_filename("The.Show.E07.1080p.mkv")
+        chinese = normalize_filename("纪录片.第12集.4K.mp4")
+        self.assertEqual(english.identity_kind, "series_episode")
+        self.assertEqual(english.episode_id, "e007")
+        self.assertEqual(chinese.identity_kind, "series_episode")
+        self.assertEqual(chinese.episode_id, "e012")
+
+    def test_compact_eight_digit_date_is_a_dated_episode(self) -> None:
+        info = normalize_filename("brothalovers.20150728.lynna.nilsson.mp4")
+        self.assertEqual(info.identity_kind, "dated_episode")
+        self.assertEqual(info.series_key, "brothalovers")
+        self.assertEqual(info.episode_date, "2015-07-28")
+
+    def test_site_brand_is_removed_but_unique_at_identifier_is_preserved(self) -> None:
+        info = normalize_filename("2048社区 - fun2048.com@fc1298546.mp4")
+        self.assertEqual(info.catalog_key, "fc-1298546")
+        self.assertNotIn("2048社区", info.primary)
+
     def test_chinese_character_inside_title_is_not_a_part_marker(self) -> None:
         self.assertIsNone(normalize_filename("上海滩.mp4").part_marker)
         self.assertEqual(normalize_filename("电影-上.mp4").part_marker, "segment:上")

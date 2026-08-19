@@ -11,7 +11,7 @@ from .utils import user_data_dir
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "recursive": True,
-    "similarity_mode": "标准（推荐）",
+    "similarity_mode": "严格作品识别（推荐）",
     "read_metadata": True,
     "hash_mode": "smart",
     "window_geometry": "1180x760",

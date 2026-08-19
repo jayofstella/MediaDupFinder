@@ -427,7 +427,7 @@ def merge_duplicate_groups(
         name_confidences = [group.confidence for group in component if group.match_kind == "name"]
         if "hash" in kinds and "name" in kinds:
             kind = "mixed"
-            reason = "组内既有 MD5 完全相同文件，也有文件名相似版本"
+            reason = "组内既有 MD5 完全相同文件，也有作品身份相同的不同版本"
         elif "hash" in kinds:
             kind = "hash"
             reason = "文件大小与完整 MD5 均相同"

@@ -106,6 +106,16 @@ class DuplicateGroup:
         return self.total_size - keep.size
 
     @property
+    def duration_span_seconds(self) -> Optional[float]:
+        durations = [
+            item.duration_seconds for item in self.files
+            if item.duration_seconds is not None and item.duration_seconds > 0
+        ]
+        if len(durations) < 2:
+            return None
+        return max(durations) - min(durations)
+
+    @property
     def display_name(self) -> str:
         for item in self.files:
             if item.name_info.catalog_key:
@@ -115,8 +125,8 @@ class DuplicateGroup:
 
     @property
     def match_label(self) -> str:
-        return {"hash": "MD5", "mixed": "混合", "name": "文件名"}.get(
-            self.match_kind, "文件名"
+        return {"hash": "MD5", "mixed": "混合", "name": "作品身份"}.get(
+            self.match_kind, "作品身份"
         )
 
 

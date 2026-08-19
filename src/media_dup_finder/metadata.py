@@ -142,13 +142,17 @@ def assess_group_metadata(group: DuplicateGroup) -> None:
     if len(durations) >= 2:
         shortest, longest = durations[0], durations[-1]
         difference = longest - shortest
-        if difference <= max(8.0, shortest * 0.03):
+        if difference <= max(8.0, shortest * 0.01):
             notes.append("视频时长接近")
-        elif difference > max(300.0, shortest * 0.12):
+        elif difference > max(30.0, shortest * 0.03):
             group.safety_warning = True
-            notes.append("片长相差约 {:.0f} 分钟，可能是不同剪辑或不完整文件".format(difference / 60.0))
+            if difference >= 60.0:
+                gap = "{:.1f} 分钟".format(difference / 60.0)
+            else:
+                gap = "{:.0f} 秒".format(difference)
+            notes.append("片长相差约 {}，可能不是同一内容或存在缺失".format(gap))
         else:
-            notes.append("片长存在一定差异，建议播放复核")
+            notes.append("片长存在小幅差异，建议播放复核")
 
     heights = [record.height for record in group.files if record.height]
     if len(heights) >= 2 and max(heights) >= min(heights) * 2:

@@ -23,12 +23,18 @@ from .hashing import (
     HASH_MODE_SMART,
     HashProgressState,
     HashScanStats,
-    HashWorkload,
     estimate_hash_workload,
     find_exact_duplicate_groups,
     merge_duplicate_groups,
 )
-from .matching import group_similar_files
+from .locations import (
+    DriveLocation,
+    directory_identity,
+    list_drive_locations,
+    merge_unique_directory_paths,
+    parse_pasted_directory_paths,
+)
+from .matching import MatchingProgressState, group_similar_files
 from .metadata import assess_group_metadata, find_ffprobe, probe_records
 from .models import DuplicateGroup, FileRecord, ScanResult, VIDEO_EXTENSIONS
 from .operations import DeletionResult, send_to_recycle_bin
@@ -38,9 +44,9 @@ from .utils import format_bytes, format_duration
 
 
 SIMILARITY_MODES: Dict[str, float] = {
-    "保守（少误报）": 0.90,
-    "标准（推荐）": 0.84,
-    "宽松（多候选）": 0.76,
+    "严格作品识别（推荐）": 0.92,
+    "标准作品识别": 0.89,
+    "兼容轻微拼写差异": 0.86,
 }
 FILE_MODES = ("视频文件（推荐）", "全部文件")
 HASH_MODES: Dict[str, str] = {
@@ -49,7 +55,141 @@ HASH_MODES: Dict[str, str] = {
     "关闭 MD5 扫描": HASH_MODE_OFF,
 }
 HASH_MODE_LABELS = {value: key for key, value in HASH_MODES.items()}
-HASH_CONFIRM_THRESHOLD_BYTES = 20 * 1024 * 1024 * 1024
+
+
+def format_matching_progress_text(state: MatchingProgressState) -> str:
+    """Build a compact progress line whose important counts remain visible."""
+
+    labels = {
+        "个文件": ("已解析", "个文件", "个"),
+        "次候选": ("已生成", "次候选", "次"),
+        "次比对": ("已比对", "次比对", "次"),
+        "个候选文件": ("已整理", "个候选文件", "个"),
+    }
+    action, remaining_unit, rate_unit = labels.get(
+        state.unit, ("已处理", state.unit, "项")
+    )
+    speed = state.processed_items / max(0.001, state.elapsed_seconds)
+    eta_seconds = 0.0 if state.remaining_items == 0 else state.eta_seconds
+    eta = format_duration(eta_seconds) if eta_seconds is not None else "计算中"
+    current = " · 当前：{}".format(state.current_name) if state.current_name else ""
+    return (
+        "{} {:,}/{:,} · 剩余 {:,} {} · {:,.1f} {}/秒 · 已用 {} · "
+        "预计剩余 {}{}"
+    ).format(
+        action,
+        state.processed_items,
+        state.total_items,
+        state.remaining_items,
+        remaining_unit,
+        speed,
+        rate_unit,
+        format_duration(state.elapsed_seconds),
+        eta,
+        current,
+    )
+
+
+IDENTITY_KIND_LABELS = {
+    "catalog": "作品编号",
+    "dated_episode": "系列日期单集",
+    "series_episode": "季集编号",
+    "title": "影视标题",
+}
+
+
+def format_part_marker(marker: Optional[str]) -> str:
+    if not marker:
+        return "未标分段"
+    if marker.startswith("part") and marker[4:].isdigit():
+        return "第 {} 段".format(int(marker[4:]))
+    if marker.startswith("segment:"):
+        value = marker.split(":", 1)[1]
+        return "{} 段".format(value) if value in {"A", "B"} else value
+    return marker
+
+
+def group_identity_basis_label(group: DuplicateGroup) -> str:
+    if group.match_kind == "hash":
+        return "完整 MD5"
+    if group.match_kind == "mixed":
+        return "身份 + MD5"
+    labels = {
+        IDENTITY_KIND_LABELS.get(record.name_info.identity_kind, "其他身份")
+        for record in group.files
+    }
+    return next(iter(labels)) if len(labels) == 1 else "多种身份"
+
+
+def sort_records_for_display(
+    records: Sequence[FileRecord],
+    column: str,
+    reverse: bool,
+) -> List[FileRecord]:
+    """Sort known values while always leaving unknown metadata at the end."""
+
+    action_order = {"未决定": 0, "保留": 1, "删除": 2}
+
+    def value(record: FileRecord) -> object:
+        height = record.height or record.guessed_height
+        values = {
+            "action": action_order.get(record.action, 0),
+            "name": record.path.name.casefold(),
+            "work": record.name_info.cleaned_display.casefold(),
+            "identity": IDENTITY_KIND_LABELS.get(
+                record.name_info.identity_kind, record.name_info.identity_kind,
+            ),
+            "segment": record.name_info.part_marker or "",
+            "size": record.size,
+            "resolution": (
+                (record.width or (height * 16 // 9)) * height if height else None
+            ),
+            "duration": record.duration_seconds,
+            "format": record.extension,
+            "codec": record.codec.casefold() if record.codec else None,
+            "md5": record.content_md5 or None,
+            "hash_status": record.hash_source,
+            "modified": record.modified_time,
+            "folder": str(record.path.parent).casefold(),
+        }
+        return values.get(column, record.path.name.casefold())
+
+    known = []
+    unknown = []
+    for record in records:
+        item_value = value(record)
+        target = unknown if item_value is None else known
+        target.append((item_value, str(record.path).casefold(), record))
+    known.sort(key=lambda item: (item[0], item[1]), reverse=reverse)
+    unknown.sort(key=lambda item: item[1])
+    return [item[2] for item in known + unknown]
+
+
+def sort_groups_for_display(
+    groups: Sequence[DuplicateGroup],
+    column: str,
+    reverse: bool,
+) -> List[DuplicateGroup]:
+    def value(group: DuplicateGroup) -> object:
+        values = {
+            "name": group.display_name.casefold(),
+            "kind": group_identity_basis_label(group),
+            "count": len(group.files),
+            "saving": group.estimated_savings,
+            "duration_span": group.duration_span_seconds,
+            "confidence": group.confidence,
+        }
+        return values.get(column, group.display_name.casefold())
+
+    known = []
+    unknown = []
+    for group in groups:
+        item_value = value(group)
+        target = unknown if item_value is None else known
+        target.append((item_value, group.display_name.casefold(), group))
+    known.sort(key=lambda item: (item[0], item[1]), reverse=reverse)
+    unknown.sort(key=lambda item: item[1])
+    return [item[2] for item in known + unknown]
 
 
 def _timestamp_text(value: float) -> str:
@@ -82,7 +222,10 @@ def build_file_information(record: FileRecord, group: DuplicateGroup) -> str:
     md5 = record.content_md5 or "未计算"
     codec = record.codec or "未知"
     catalog = record.name_info.catalog_key or "未识别"
-    part_marker = record.name_info.part_marker or "无"
+    part_marker = format_part_marker(record.name_info.part_marker)
+    identity_kind = IDENTITY_KIND_LABELS.get(
+        record.name_info.identity_kind, record.name_info.identity_kind,
+    )
 
     return "\n".join([
         "【文件】",
@@ -108,21 +251,256 @@ def build_file_information(record: FileRecord, group: DuplicateGroup) -> str:
         "MD5 状态：{}".format(record.hash_source),
         "",
         "【名称解析】",
+        "身份类型：{}".format(identity_kind),
+        "识别作品：{}".format(record.name_info.cleaned_display),
+        "作品身份键：{}".format(record.name_info.work_key or "无"),
         "作品编号：{}".format(catalog),
         "归一化标题：{}".format(record.name_info.primary or "无"),
         "匹配别名：{}".format(aliases),
         "分段标记：{}".format(part_marker),
+        "系列名称键：{}".format(record.name_info.series_key or "无"),
+        "单集日期：{}".format(record.name_info.episode_date or "无"),
+        "季集编号：{}".format(record.name_info.episode_id or "无"),
         "识别年份：{}".format("、".join(map(str, record.name_info.years)) or "无"),
         "",
         "【候选组】",
         "候选作品：{}".format(group.display_name),
-        "识别依据：{}".format(group.match_label),
+        "身份/依据：{}".format(group_identity_basis_label(group)),
         "置信度：{:.1f}%".format(group.confidence * 100),
         "匹配原因：{}".format(group.reason),
+        "组内时长差：{}".format(
+            format_duration(group.duration_span_seconds)
+            if group.duration_span_seconds is not None else "未知"
+        ),
         "辅助提示：{}".format(note),
         "重点复核：{}".format(warning),
         "当前决定：{}".format(record.action),
     ])
+
+
+REPORT_COLUMNS = (
+    "候选组", "候选作品", "身份/依据", "匹配原因", "辅助提示", "重点复核",
+    "置信度", "决定", "文件名", "识别作品", "身份类型", "作品身份键",
+    "作品编号", "分段标记", "系列名称键", "单集日期", "季集编号",
+    "完整路径", "所在目录", "大小(字节)", "MD5", "MD5状态", "分辨率",
+    "时长(秒)", "编码", "格式", "修改时间",
+)
+
+
+def build_report_row(
+    group_number: int,
+    group: DuplicateGroup,
+    record: FileRecord,
+) -> List[object]:
+    info = record.name_info
+    return [
+        group_number,
+        group.display_name,
+        group_identity_basis_label(group),
+        group.reason,
+        group.metadata_note,
+        "是" if group.safety_warning else "否",
+        "{:.1f}%".format(group.confidence * 100),
+        record.action,
+        record.path.name,
+        info.cleaned_display,
+        IDENTITY_KIND_LABELS.get(info.identity_kind, info.identity_kind),
+        info.work_key,
+        info.catalog_key or "",
+        format_part_marker(info.part_marker) if info.part_marker else "",
+        info.series_key or "",
+        info.episode_date or "",
+        info.episode_id or "",
+        str(record.path),
+        str(record.path.parent),
+        record.size,
+        record.content_md5 or "",
+        record.hash_source,
+        record.resolution,
+        "" if record.duration_seconds is None else round(record.duration_seconds, 2),
+        record.codec or "",
+        record.extension.lstrip(".").upper(),
+        datetime.fromtimestamp(record.modified_time).isoformat(timespec="seconds"),
+    ]
+
+
+class BatchDirectoryDialog:
+    """Windows-friendly multi-drive and multi-folder selection dialog."""
+
+    def __init__(self, parent: tk.Misc, existing: Sequence[str]) -> None:
+        self.parent = parent
+        self.existing = list(existing)
+        self.existing_identities = {
+            directory_identity(value) for value in self.existing if str(value).strip()
+        }
+        self.drive_locations: List[DriveLocation] = list_drive_locations()
+        self.result: Optional[List[str]] = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("批量添加扫描目录")
+        self.window.geometry("720x610")
+        self.window.minsize(620, 540)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer,
+            text="可一次选择多个磁盘；列表为多选模式，直接依次点击盘符即可，无需按 Ctrl。",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        drive_box = ttk.LabelFrame(outer, text=" 选择磁盘盘符 ", padding=8)
+        drive_box.pack(fill="both")
+        drive_frame = ttk.Frame(drive_box)
+        drive_frame.pack(fill="both", expand=True)
+        self.drive_list = tk.Listbox(
+            drive_frame,
+            height=7,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            activestyle="dotbox",
+        )
+        self.drive_list.pack(side="left", fill="both", expand=True)
+        drive_scroll = ttk.Scrollbar(drive_frame, orient="vertical", command=self.drive_list.yview)
+        drive_scroll.pack(side="right", fill="y")
+        self.drive_list.configure(yscrollcommand=drive_scroll.set)
+        for location in self.drive_locations:
+            suffix = "  （已在扫描列表）" if directory_identity(location.path) in self.existing_identities else ""
+            self.drive_list.insert(
+                tk.END,
+                "{}    {}{}".format(location.path, location.kind, suffix),
+            )
+
+        drive_buttons = ttk.Frame(drive_box)
+        drive_buttons.pack(fill="x", pady=(7, 0))
+        ttk.Button(
+            drive_buttons, text="选择全部固定磁盘", command=self._select_fixed_drives,
+        ).pack(side="left")
+        ttk.Button(
+            drive_buttons, text="清除盘符选择", command=lambda: self.drive_list.selection_clear(0, tk.END),
+        ).pack(side="left", padx=(6, 0))
+
+        other_box = ttk.LabelFrame(outer, text=" 其他文件夹（可选） ", padding=8)
+        other_box.pack(fill="both", pady=(9, 0))
+        other_frame = ttk.Frame(other_box)
+        other_frame.pack(fill="both", expand=True)
+        self.other_list = tk.Listbox(
+            other_frame,
+            height=4,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            activestyle="none",
+        )
+        self.other_list.pack(side="left", fill="both", expand=True)
+        other_buttons = ttk.Frame(other_frame)
+        other_buttons.pack(side="right", fill="y", padx=(7, 0))
+        ttk.Button(other_buttons, text="选择文件夹…", command=self._add_other_directory).pack(fill="x")
+        ttk.Button(other_buttons, text="移除所选", command=self._remove_other_directories).pack(
+            fill="x", pady=(6, 0)
+        )
+
+        paste_box = ttk.LabelFrame(outer, text=" 批量粘贴路径（可选，每行一个） ", padding=8)
+        paste_box.pack(fill="both", expand=True, pady=(9, 0))
+        ttk.Label(
+            paste_box,
+            text="支持从资源管理器“复制为路径”后直接粘贴，带英文引号也能识别。",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        self.paste_text = tk.Text(paste_box, height=5, wrap="none")
+        self.paste_text.pack(fill="both", expand=True)
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(actions, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(
+            actions, text="确定添加", style="Accent.TButton", command=self._accept,
+        ).pack(side="right", padx=(0, 7))
+
+    def _select_fixed_drives(self) -> None:
+        self.drive_list.selection_clear(0, tk.END)
+        for index, location in enumerate(self.drive_locations):
+            if location.kind == "固定磁盘":
+                self.drive_list.selection_set(index)
+
+    def _add_other_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self.window,
+            title="选择其他扫描目录",
+            mustexist=True,
+        )
+        if not selected:
+            return
+        current = list(self.other_list.get(0, tk.END))
+        for value in merge_unique_directory_paths([selected], current):
+            self.other_list.insert(tk.END, value)
+
+    def _remove_other_directories(self) -> None:
+        for index in reversed(self.other_list.curselection()):
+            self.other_list.delete(index)
+
+    def _accept(self) -> None:
+        selected_drives = [
+            self.drive_locations[index].path for index in self.drive_list.curselection()
+        ]
+        other_directories = list(self.other_list.get(0, tk.END))
+        pasted = parse_pasted_directory_paths(self.paste_text.get("1.0", "end"))
+        candidates = merge_unique_directory_paths(
+            selected_drives + other_directories + pasted,
+            existing=self.existing,
+        )
+        if not candidates:
+            messagebox.showinfo(
+                "没有新目录",
+                "请选择至少一个尚未添加的磁盘或文件夹。",
+                parent=self.window,
+            )
+            return
+
+        valid: List[str] = []
+        invalid: List[str] = []
+        for value in candidates:
+            try:
+                accessible = Path(value).is_dir()
+            except OSError:
+                accessible = False
+            (valid if accessible else invalid).append(value)
+
+        if invalid:
+            preview = "\n".join(invalid[:8])
+            if not valid:
+                messagebox.showerror(
+                    "目录不可访问",
+                    "以下磁盘或目录当前无法访问：\n\n{}".format(preview),
+                    parent=self.window,
+                )
+                return
+            if not messagebox.askyesno(
+                "部分目录不可访问",
+                "以下位置将被跳过：\n\n{}\n\n是否继续添加其余 {} 个目录？".format(
+                    preview, len(valid)
+                ),
+                parent=self.window,
+            ):
+                return
+
+        self.result = valid
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> Optional[List[str]]:
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
 
 
 class MediaDupFinderApp:
@@ -138,6 +516,10 @@ class MediaDupFinderApp:
         self.cancel_event = threading.Event()
         self.busy = False
         self.busy_kind = ""
+        self.group_sort_column = "saving"
+        self.group_sort_reverse = True
+        self.detail_sort_column = "size"
+        self.detail_sort_reverse = True
 
         self.root.title("{} v{}".format(__app_name__, __version__))
         self._set_window_icon()
@@ -183,7 +565,7 @@ class MediaDupFinderApp:
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
         file_menu = tk.Menu(menu, tearoff=False)
-        file_menu.add_command(label="添加扫描目录…", command=self.add_directory)
+        file_menu.add_command(label="批量添加扫描目录…", command=self.add_directory)
         file_menu.add_command(label="导出当前报告…", command=self.export_report)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
@@ -211,7 +593,7 @@ class MediaDupFinderApp:
         ttk.Label(header, text=__app_name__, style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="综合文件名、MD5 与视频信息识别候选；先预览、再选择，删除默认进入回收站。",
+            text="先解析作品编号、系列单集或影视标题，再结合 MD5 与视频属性筛选候选。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -224,7 +606,7 @@ class MediaDupFinderApp:
         list_frame.columnconfigure(0, weight=1)
         self.root_list = tk.Listbox(
             list_frame,
-            height=3,
+            height=4,
             selectmode=tk.EXTENDED,
             activestyle="none",
             exportselection=False,
@@ -232,9 +614,14 @@ class MediaDupFinderApp:
         self.root_list.grid(row=0, column=0, sticky="nsew")
         list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.root_list.yview)
         list_scroll.grid(row=0, column=1, sticky="ns")
-        self.root_list.configure(yscrollcommand=list_scroll.set)
+        list_scroll_x = ttk.Scrollbar(list_frame, orient="horizontal", command=self.root_list.xview)
+        list_scroll_x.grid(row=1, column=0, sticky="ew")
+        self.root_list.configure(
+            yscrollcommand=list_scroll.set,
+            xscrollcommand=list_scroll_x.set,
+        )
 
-        self.add_button = ttk.Button(source_box, text="添加目录…", command=self.add_directory)
+        self.add_button = ttk.Button(source_box, text="批量添加目录…", command=self.add_directory)
         self.add_button.grid(row=0, column=1, sticky="ew", pady=(0, 4))
         self.remove_button = ttk.Button(source_box, text="移除所选", command=self.remove_directories)
         self.remove_button.grid(row=1, column=1, sticky="new")
@@ -247,20 +634,24 @@ class MediaDupFinderApp:
         self.recursive_var = tk.BooleanVar(value=True)
         self.metadata_var = tk.BooleanVar(value=True)
         self.hash_mode_var = tk.StringVar(value="智能扫描（推荐）")
-        self.mode_var = tk.StringVar(value="标准（推荐）")
+        self.mode_var = tk.StringVar(value="严格作品识别（推荐）")
         self.file_mode_var = tk.StringVar(value=FILE_MODES[0])
         self.recursive_check = ttk.Checkbutton(options, text="包含子目录", variable=self.recursive_var)
         self.recursive_check.grid(
             row=0, column=0, sticky="w", padx=(0, 14)
         )
-        self.metadata_check = ttk.Checkbutton(options, text="读取候选视频分辨率", variable=self.metadata_var)
+        self.metadata_check = ttk.Checkbutton(
+            options,
+            text="读取视频属性（分辨率/时长/编码）",
+            variable=self.metadata_var,
+        )
         self.metadata_check.grid(
             row=0, column=1, sticky="w", padx=(0, 14)
         )
-        ttk.Label(options, text="相似度：").grid(row=0, column=2, sticky="e")
+        ttk.Label(options, text="作品识别：").grid(row=0, column=2, sticky="e")
         self.mode_combo = ttk.Combobox(
             options, textvariable=self.mode_var, values=tuple(SIMILARITY_MODES),
-            state="readonly", width=15,
+            state="readonly", width=20,
         )
         self.mode_combo.grid(row=0, column=3, sticky="w", padx=(0, 14))
         ttk.Label(options, text="类型：").grid(row=0, column=4, sticky="e")
@@ -279,7 +670,7 @@ class MediaDupFinderApp:
         )
         self.hash_mode_combo.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
-            options, text="年份冲突、分段不同或片长差异较大时会提高保护级别",
+            options, text="MD5 模式在开始前确定；扫描过程中不会再弹窗询问",
             style="Subtitle.TLabel",
         ).grid(row=1, column=3, columnspan=3, sticky="e", pady=(6, 0))
 
@@ -302,37 +693,53 @@ class MediaDupFinderApp:
         paned.add(left, weight=2)
         paned.add(right, weight=5)
 
-        ttk.Label(left, text="相似作品组").pack(anchor="w", pady=(0, 4))
+        ttk.Label(left, text="同作品候选组（点击列标题排序）").pack(anchor="w", pady=(0, 4))
         group_frame = ttk.Frame(left)
         group_frame.pack(fill="both", expand=True, padx=(0, 5))
         group_frame.rowconfigure(0, weight=1)
         group_frame.columnconfigure(0, weight=1)
         self.group_tree = ttk.Treeview(
             group_frame,
-            columns=("name", "kind", "count", "saving", "confidence"),
+            columns=("name", "kind", "count", "saving", "duration_span", "confidence"),
             show="headings",
             selectmode="browse",
         )
-        self.group_tree.heading("name", text="作品")
-        self.group_tree.heading("kind", text="依据")
-        self.group_tree.heading("count", text="数量")
-        self.group_tree.heading("saving", text="可释放")
-        self.group_tree.heading("confidence", text="置信度")
+        self.group_heading_labels = {
+            "name": "识别作品",
+            "kind": "身份/依据",
+            "count": "数量",
+            "saving": "可释放",
+            "duration_span": "时长差",
+            "confidence": "置信度",
+        }
+        for column, label in self.group_heading_labels.items():
+            self.group_tree.heading(
+                column,
+                text=label,
+                command=lambda selected=column: self._sort_group_tree(selected),
+            )
         self.group_tree.column("name", width=150, minwidth=100, anchor="w")
-        self.group_tree.column("kind", width=52, minwidth=48, anchor="center", stretch=False)
+        self.group_tree.column("kind", width=82, minwidth=72, anchor="center", stretch=False)
         self.group_tree.column("count", width=48, minwidth=44, anchor="center", stretch=False)
         self.group_tree.column("saving", width=78, minwidth=66, anchor="e", stretch=False)
+        self.group_tree.column("duration_span", width=68, minwidth=60, anchor="center", stretch=False)
         self.group_tree.column("confidence", width=62, minwidth=56, anchor="center", stretch=False)
         self.group_tree.grid(row=0, column=0, sticky="nsew")
         group_scroll = ttk.Scrollbar(group_frame, orient="vertical", command=self.group_tree.yview)
         group_scroll.grid(row=0, column=1, sticky="ns")
-        self.group_tree.configure(yscrollcommand=group_scroll.set)
+        group_scroll_x = ttk.Scrollbar(
+            group_frame, orient="horizontal", command=self.group_tree.xview,
+        )
+        group_scroll_x.grid(row=1, column=0, sticky="ew")
+        self.group_tree.configure(
+            yscrollcommand=group_scroll.set, xscrollcommand=group_scroll_x.set,
+        )
         self.group_tree.tag_configure("warning", foreground="#b54708")
         self.group_tree.bind("<<TreeviewSelect>>", self._on_group_select)
 
         detail_title = ttk.Frame(right)
         detail_title.pack(fill="x", pady=(0, 4))
-        ttk.Label(detail_title, text="组内文件（可多选）").pack(side="left")
+        ttk.Label(detail_title, text="组内文件（可多选；点击任意列排序）").pack(side="left")
         self.reason_label = ttk.Label(detail_title, text="", style="Subtitle.TLabel")
         self.reason_label.pack(side="right")
 
@@ -341,28 +748,37 @@ class MediaDupFinderApp:
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
         columns = (
-            "action", "name", "size", "resolution", "duration", "format", "codec",
-            "md5", "hash_status", "modified", "folder",
+            "action", "name", "work", "identity", "segment", "size", "resolution",
+            "duration", "format", "codec", "md5", "hash_status", "modified", "folder",
         )
         self.detail_tree = ttk.Treeview(
             detail_frame, columns=columns, show="headings", selectmode="extended",
         )
         headings = {
-            "action": "决定", "name": "文件名", "size": "大小", "resolution": "分辨率",
+            "action": "决定", "name": "文件名", "work": "识别作品",
+            "identity": "身份类型", "segment": "分段",
+            "size": "大小", "resolution": "分辨率",
             "duration": "时长", "format": "格式", "codec": "编码", "md5": "MD5",
             "hash_status": "MD5状态", "modified": "修改时间", "folder": "所在目录",
         }
+        self.detail_heading_labels = headings
         widths = {
-            "action": 66, "name": 230, "size": 88, "resolution": 115,
+            "action": 66, "name": 230, "work": 170, "identity": 92, "segment": 76,
+            "size": 88, "resolution": 115,
             "duration": 70, "format": 56, "codec": 70, "md5": 92,
             "hash_status": 150, "modified": 130, "folder": 260,
         }
         anchors = {
             "action": "center", "size": "e", "resolution": "center",
-            "duration": "center", "format": "center", "codec": "center", "md5": "center",
+            "identity": "center", "segment": "center", "duration": "center", "format": "center",
+            "codec": "center", "md5": "center",
         }
         for column in columns:
-            self.detail_tree.heading(column, text=headings[column])
+            self.detail_tree.heading(
+                column,
+                text=headings[column],
+                command=lambda selected=column: self._sort_detail_tree(selected),
+            )
             self.detail_tree.column(
                 column, width=widths[column], minwidth=50,
                 anchor=anchors.get(column, "w"), stretch=column in {"name", "folder"},
@@ -438,8 +854,8 @@ class MediaDupFinderApp:
         self.metadata_var.set(bool(self.settings.get("read_metadata", True)))
         hash_mode = str(self.settings.get("hash_mode") or HASH_MODE_SMART)
         self.hash_mode_var.set(HASH_MODE_LABELS.get(hash_mode, "智能扫描（推荐）"))
-        mode = str(self.settings.get("similarity_mode") or "标准（推荐）")
-        self.mode_var.set(mode if mode in SIMILARITY_MODES else "标准（推荐）")
+        mode = str(self.settings.get("similarity_mode") or "严格作品识别（推荐）")
+        self.mode_var.set(mode if mode in SIMILARITY_MODES else "严格作品识别（推荐）")
         for value in self.settings.get("last_roots", []):
             path = Path(str(value))
             if path.is_dir():
@@ -460,14 +876,13 @@ class MediaDupFinderApp:
             pass
 
     def add_directory(self) -> None:
-        selected = filedialog.askdirectory(title="选择要扫描的目录", mustexist=True)
+        existing = list(self.root_list.get(0, tk.END))
+        selected = BatchDirectoryDialog(self.root, existing).show()
         if not selected:
             return
-        existing = {os.path.normcase(os.path.abspath(value)) for value in self.root_list.get(0, tk.END)}
-        identity = os.path.normcase(os.path.abspath(selected))
-        if identity not in existing:
-            self.root_list.insert(tk.END, selected)
-            self.status_var.set("已添加目录：{}".format(selected))
+        for value in selected:
+            self.root_list.insert(tk.END, value)
+        self.status_var.set("已批量添加 {} 个扫描目录。".format(len(selected)))
 
     def remove_directories(self) -> None:
         for index in reversed(self.root_list.curselection()):
@@ -519,57 +934,25 @@ class MediaDupFinderApp:
             )
         )
 
-    def _handle_hash_confirmation(
-        self,
-        payload: Tuple[HashWorkload, "queue.Queue[str]"],
-    ) -> None:
-        workload, response = payload
-        mode_label = HASH_MODE_LABELS.get(workload.mode, workload.mode)
-        maximum_seconds_fast = workload.maximum_full_bytes / float(500 * 1024 * 1024)
-        maximum_seconds_slow = workload.maximum_full_bytes / float(80 * 1024 * 1024)
-        if workload.mode == HASH_MODE_SMART:
-            detail = (
-                "快速指纹预计读取 {}；只有指纹相同的文件才继续计算完整 MD5，"
-                "最坏情况下再读取 {}。"
-            ).format(
-                format_bytes(workload.quick_bytes),
-                format_bytes(workload.maximum_full_bytes),
-            )
-        else:
-            detail = "将校验缓存并对同大小候选完整读取最多 {}。".format(
-                format_bytes(workload.maximum_full_bytes)
-            )
-        answer = messagebox.askyesnocancel(
-            "MD5 扫描量较大",
-            "当前模式：{}\n"
-            "发现 {} 个同大小候选，分布在 {} 个大小组。\n\n"
-            "{}\n\n"
-            "按常见磁盘速度，完整读取上限约需 {}～{}。\n\n"
-            "选择“是”继续 MD5；选择“否”跳过 MD5 但保留文件名结果；"
-            "选择“取消”停止本次扫描。".format(
-                mode_label,
-                workload.candidate_files,
-                workload.size_groups,
-                detail,
-                format_duration(maximum_seconds_fast),
-                format_duration(maximum_seconds_slow),
-            ),
-        )
-        response.put("continue" if answer is True else "skip" if answer is False else "cancel")
+    def _handle_matching_progress(self, state: MatchingProgressState) -> None:
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=100, value=state.percent)
+        self.summary_label.configure(text="{}：{:.1f}%".format(state.phase, state.percent))
+        self.status_var.set(format_matching_progress_text(state))
 
     def start_scan(self) -> None:
         if self.busy:
             return
         roots = [Path(value) for value in self.root_list.get(0, tk.END)]
         if not roots:
-            messagebox.showwarning("尚未选择目录", "请先点击“添加目录”，选择至少一个扫描位置。")
+            messagebox.showwarning("尚未选择目录", "请先点击“批量添加目录”，选择至少一个扫描位置。")
             return
         invalid = [str(path) for path in roots if not path.is_dir()]
         if invalid:
             messagebox.showerror("目录不可用", "以下目录不存在或无法访问：\n\n" + "\n".join(invalid))
             return
 
-        threshold = SIMILARITY_MODES.get(self.mode_var.get(), 0.84)
+        threshold = SIMILARITY_MODES.get(self.mode_var.get(), 0.92)
         extensions: Optional[Iterable[str]] = None
         if self.file_mode_var.get() == "全部文件":
             extensions = []
@@ -600,32 +983,24 @@ class MediaDupFinderApp:
                     self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
                     return
 
-                self.events.put(("status", "已扫描 {} 个文件，正在比较文件名…".format(len(files))))
-                name_groups = group_similar_files(files, threshold=threshold)
+                self.events.put(("status", "已扫描 {} 个文件，正在解析作品身份…".format(len(files))))
+
+                def matching_progress(state: MatchingProgressState) -> None:
+                    self.events.put(("matching_progress", state))
+
+                name_groups = group_similar_files(
+                    files,
+                    threshold=threshold,
+                    cancel_event=self.cancel_event,
+                    progress=matching_progress,
+                )
+                if self.cancel_event.is_set():
+                    self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
+                    return
                 exact_groups = []
                 effective_hash_mode = requested_hash_mode
                 hash_stats = HashScanStats(mode=effective_hash_mode)
                 workload = estimate_hash_workload(files, effective_hash_mode)
-                if (
-                    effective_hash_mode != HASH_MODE_OFF
-                    and workload.maximum_full_bytes >= HASH_CONFIRM_THRESHOLD_BYTES
-                ):
-                    response: "queue.Queue[str]" = queue.Queue(maxsize=1)
-                    self.events.put(("hash_confirmation", (workload, response)))
-                    decision: Optional[str] = None
-                    while decision is None and not self.cancel_event.is_set():
-                        try:
-                            decision = response.get(timeout=0.1)
-                        except queue.Empty:
-                            continue
-                    if self.cancel_event.is_set() or decision == "cancel":
-                        self.cancel_event.set()
-                        self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
-                        return
-                    if decision == "skip":
-                        effective_hash_mode = HASH_MODE_OFF
-                        hash_stats = HashScanStats(mode="skipped")
-                        self.events.put(("status", "已跳过 MD5，继续整理文件名候选结果…"))
 
                 if effective_hash_mode != HASH_MODE_OFF:
                     self.events.put((
@@ -713,10 +1088,10 @@ class MediaDupFinderApp:
                 event, payload = self.events.get_nowait()
                 if event == "status":
                     self.status_var.set(str(payload))
+                elif event == "matching_progress":
+                    self._handle_matching_progress(payload)  # type: ignore[arg-type]
                 elif event == "hash_progress":
                     self._handle_hash_progress(payload)  # type: ignore[arg-type]
-                elif event == "hash_confirmation":
-                    self._handle_hash_confirmation(payload)  # type: ignore[arg-type]
                 elif event == "progress_indeterminate":
                     self._set_progress_indeterminate()
                 elif event == "metadata_missing":
@@ -752,8 +1127,6 @@ class MediaDupFinderApp:
                 format_bytes(result.hash_bytes_read),
                 result.hash_cache_hits,
             )
-        elif result.hash_mode == "skipped":
-            hash_detail = " · 本次已跳过 MD5"
         self.summary_label.configure(text=(
             "扫描 {} 个文件 · 找到 {} 组 / {} 个候选 · 含 {} 个 MD5 组 · 预计可释放 {}{}"
             .format(
@@ -765,7 +1138,7 @@ class MediaDupFinderApp:
         if self.groups:
             self.status_var.set("扫描完成{}。请逐组检查，软件不会自动删除。".format(warning_text))
         else:
-            self.status_var.set("扫描完成{}，未找到符合当前规则的相似文件。".format(warning_text))
+            self.status_var.set("扫描完成{}，未找到符合当前规则的同作品候选。".format(warning_text))
 
     def _handle_worker_error(self, payload: Tuple[str, str]) -> None:
         self._set_busy(False)
@@ -773,26 +1146,68 @@ class MediaDupFinderApp:
         self.status_var.set("操作失败：{}".format(message))
         messagebox.showerror("操作失败", "{}\n\n详细信息：\n{}".format(message, details[-1800:]))
 
+    def _sort_group_tree(self, column: str) -> None:
+        if column == self.group_sort_column:
+            self.group_sort_reverse = not self.group_sort_reverse
+        else:
+            self.group_sort_column = column
+            self.group_sort_reverse = column in {
+                "count", "saving", "duration_span", "confidence",
+            }
+        self._refresh_group_tree(self.current_group_id)
+
+    def _sort_detail_tree(self, column: str) -> None:
+        if column == self.detail_sort_column:
+            self.detail_sort_reverse = not self.detail_sort_reverse
+        else:
+            self.detail_sort_column = column
+            self.detail_sort_reverse = column in {
+                "size", "resolution", "duration", "modified",
+            }
+        group = self._current_group()
+        if group:
+            self._show_group(group.group_id, list(self.detail_tree.selection()))
+
+    def _update_sort_headings(self) -> None:
+        for column, label in self.group_heading_labels.items():
+            suffix = " ▼" if self.group_sort_reverse else " ▲"
+            self.group_tree.heading(
+                column,
+                text=label + suffix if column == self.group_sort_column else label,
+            )
+        for column, label in self.detail_heading_labels.items():
+            suffix = " ▼" if self.detail_sort_reverse else " ▲"
+            self.detail_tree.heading(
+                column,
+                text=label + suffix if column == self.detail_sort_column else label,
+            )
+
     def _refresh_group_tree(self, preferred_group_id: Optional[str] = None) -> None:
         for item in self.group_tree.get_children():
             self.group_tree.delete(item)
         self.group_by_id = {group.group_id: group for group in self.groups}
         self.current_group_id = None
         self._clear_detail_tree()
-        for group in self.groups:
+        self._update_sort_headings()
+        ordered_groups = sort_groups_for_display(
+            self.groups, self.group_sort_column, self.group_sort_reverse,
+        )
+        for group in ordered_groups:
+            duration_span = group.duration_span_seconds
             self.group_tree.insert(
                 "", tk.END, iid=group.group_id,
                 values=(
                     group.display_name,
-                    group.match_label,
+                    group_identity_basis_label(group),
                     len(group.files),
                     format_bytes(group.estimated_savings),
+                    format_duration(duration_span) if duration_span is not None else "—",
                     "{:.0f}%".format(group.confidence * 100),
                 ), tags=("warning",) if group.safety_warning else (),
             )
         target = preferred_group_id if preferred_group_id in self.group_by_id else None
-        if target is None and self.groups:
-            target = self.groups[0].group_id
+        if target is None and ordered_groups:
+            target = ordered_groups[0].group_id
         if target:
             self.group_tree.selection_set(target)
             self.group_tree.focus(target)
@@ -822,7 +1237,11 @@ class MediaDupFinderApp:
             detail_reason = "【重点复核】" + detail_reason
         self.reason_label.configure(text="判定：{}".format(detail_reason))
         preserve = set(preserve_selection or [])
-        for record in group.files:
+        self._update_sort_headings()
+        ordered_records = sort_records_for_display(
+            group.files, self.detail_sort_column, self.detail_sort_reverse,
+        )
+        for record in ordered_records:
             modified = datetime.fromtimestamp(record.modified_time).strftime("%Y-%m-%d %H:%M")
             tag = {"保留": "keep", "删除": "delete"}.get(record.action, "pending")
             self.detail_tree.insert(
@@ -830,6 +1249,11 @@ class MediaDupFinderApp:
                 values=(
                     record.action,
                     record.path.name,
+                    record.name_info.cleaned_display,
+                    IDENTITY_KIND_LABELS.get(
+                        record.name_info.identity_kind, record.name_info.identity_kind,
+                    ),
+                    format_part_marker(record.name_info.part_marker),
                     format_bytes(record.size),
                     record.resolution,
                     format_duration(record.duration_seconds),
@@ -844,8 +1268,8 @@ class MediaDupFinderApp:
             )
             if record.file_id in preserve:
                 self.detail_tree.selection_add(record.file_id)
-        if not preserve and group.files:
-            first = group.files[0].file_id
+        if not preserve and ordered_records:
+            first = ordered_records[0].file_id
             self.detail_tree.selection_set(first)
             self.detail_tree.focus(first)
 
@@ -1238,23 +1662,10 @@ class MediaDupFinderApp:
         try:
             with open(target, "w", newline="", encoding="utf-8-sig") as handle:
                 writer = csv.writer(handle)
-                writer.writerow([
-                    "候选组", "作品名", "识别依据", "匹配原因", "辅助提示", "重点复核",
-                    "置信度", "决定", "文件名", "完整路径", "大小(字节)", "MD5",
-                    "MD5状态", "分辨率", "时长(秒)", "格式", "修改时间",
-                ])
+                writer.writerow(REPORT_COLUMNS)
                 for number, group in enumerate(self.groups, 1):
                     for record in group.files:
-                        writer.writerow([
-                            number, group.display_name, group.match_label, group.reason,
-                            group.metadata_note, "是" if group.safety_warning else "否",
-                            "{:.1f}%".format(group.confidence * 100), record.action,
-                            record.path.name, str(record.path), record.size, record.content_md5 or "",
-                            record.hash_source, record.resolution,
-                            "" if record.duration_seconds is None else round(record.duration_seconds, 2),
-                            record.extension.lstrip(".").upper(),
-                            datetime.fromtimestamp(record.modified_time).isoformat(timespec="seconds"),
-                        ])
+                        writer.writerow(build_report_row(number, group, record))
             self.status_var.set("报告已导出：{}".format(target))
         except OSError as exc:
             messagebox.showerror("导出失败", "无法保存报告：{}".format(exc))
@@ -1262,25 +1673,27 @@ class MediaDupFinderApp:
     def show_help(self) -> None:
         messagebox.showinfo(
             "使用说明",
-            "1. 添加一个或多个目录并开始扫描。\n"
-            "2. 左侧选择相似作品组，右侧比较文件大小、分辨率和格式。\n"
+            "1. 点击“批量添加目录”，可一次勾选多个磁盘，也可添加文件夹或粘贴多行路径。\n"
+            "2. 左侧选择同作品候选组，右侧比较大小、时长、分辨率和格式；点击任意列标题即可排序。\n"
             "3. 在文件行上右键，可查看完整信息、打开文件、定位目录或复制路径。\n"
             "4. 手工设置保留/删除，或使用智能选择后再复核。\n"
             "5. 点击“执行已标记删除”，文件默认进入 Windows 回收站。\n\n"
             "识别示例：\n"
             "MIDA-630、MIDA-630-C、MIDA-630-4K 会归为同组；\n"
             "寒战、寒战1、经典剧情《寒战1》会作为候选同组。\n\n"
+            "软件先识别作品编号、日期单集、季集编号或影视标题，再比较作品身份；不会仅因文件名前缀相同就合并。\n"
+            "同一系列的不同日期、不同季集，以及 KAVR-253-2 / KAVR-253-8 这类不同分段都会隔离。\n"
             "还支持网站前缀、繁简体、年份、罗马数字、发布组标签与 MD5 完全重复。\n"
             "MD5 可选关闭、智能、完整三档；智能模式先读三段快速指纹，只有相同时才完整读取。\n"
-            "大扫描量会先提示，已验证的缓存可减少重复读取。\n\n"
-            "安全提示：不同年份、CD1/CD2、Part1/Part2 不会自动合并；片长差异大时禁止智能批量删除。",
+            "MD5 模式在开始扫描前确定，运行中不会再弹窗等待确认；已验证缓存可减少重复读取。\n\n"
+            "安全提示：不同年份、日期、季集或分段不会自动合并；片长差异超过安全范围时禁止智能批量删除。",
         )
 
     def show_about(self) -> None:
         messagebox.showinfo(
             "关于",
             "{} v{}\n\n"
-            "本地、离线、可解释的相似文件筛选工具。\n"
+            "本地、离线、可解释的同作品与完全重复文件筛选工具。\n"
             "扫描过程不会上传文件；MD5 模式只在本机读取同大小文件。\n"
             "项目采用 MIT License，可发布到 GitHub。".format(__app_name__, __version__),
         )

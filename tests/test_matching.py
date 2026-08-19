@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
-from media_dup_finder.matching import compare_records, group_similar_files
+from media_dup_finder.matching import (
+    MatchingProgressState,
+    compare_records,
+    group_similar_files,
+)
 from media_dup_finder.models import FileRecord
 from media_dup_finder.normalization import normalize_stem
 
@@ -113,6 +118,114 @@ class MatchingTests(unittest.TestCase):
     def test_catalog_leading_zeros_match(self) -> None:
         files = [record(self.folder, "ABC-001.mkv"), record(self.folder, "ABC-1.mp4")]
         self.assertEqual(len(group_similar_files(files)), 1)
+
+    def test_same_series_with_different_dates_is_not_the_same_work(self) -> None:
+        left = record(self.folder, "brothalovers.15.07.28.lynna.nilsson.mp4")
+        right = record(self.folder, "brothalovers.15.04.02.rachel.rayye.mp4")
+        score, reason = compare_records(left, right)
+        self.assertEqual(score, 0.0)
+        self.assertIn("日期", reason)
+        self.assertEqual(group_similar_files([left, right]), [])
+
+    def test_same_dated_episode_with_quality_tags_is_one_work(self) -> None:
+        files = [
+            record(self.folder, "brothalovers.15.07.28.lynna.nilsson.1080p.mp4"),
+            record(self.folder, "brothalovers.2015.07.28.lynna.nilsson.4k.mkv"),
+        ]
+        groups = group_similar_files(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].confidence, 1.0)
+
+    def test_catalog_numeric_segments_are_not_deletion_candidates(self) -> None:
+        left = record(self.folder, "kavr-253-2.mp4")
+        right = record(self.folder, "kavr-253-8.mp4")
+        score, reason = compare_records(left, right)
+        self.assertEqual(score, 0.0)
+        self.assertIn("分段", reason)
+        self.assertEqual(group_similar_files([left, right]), [])
+
+    def test_same_catalog_segment_quality_variants_can_match(self) -> None:
+        files = [
+            record(self.folder, "kavr-253-2-1080p.mp4"),
+            record(self.folder, "kavr-253-2-4k.mkv"),
+        ]
+        self.assertEqual(len(group_similar_files(files)), 1)
+
+    def test_shared_franchise_words_do_not_make_different_movies_match(self) -> None:
+        files = [
+            record(self.folder, "Harry.Potter.and.the.Sorcerers.Stone.mkv"),
+            record(self.folder, "Harry.Potter.and.the.Chamber.of.Secrets.mp4"),
+        ]
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_long_shared_series_prefix_does_not_hide_different_episode_words(self) -> None:
+        files = [
+            record(self.folder, "VeryLongSeriesName.Special.Lynna.Nilsson.mkv"),
+            record(self.folder, "VeryLongSeriesName.Special.Rachel.Rayye.mp4"),
+        ]
+        score, reason = compare_records(files[0], files[1])
+        self.assertEqual(score, 0.0)
+        self.assertIn("实质词语", reason)
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_minor_typo_in_same_parsed_title_can_still_match(self) -> None:
+        files = [
+            record(self.folder, "The.Shawshank.Redemption.1080p.mkv"),
+            record(self.folder, "The.Shawshank.Redemtion.4k.mp4"),
+        ]
+        self.assertEqual(len(group_similar_files(files, threshold=0.86)), 1)
+
+    def test_short_bare_numbers_are_not_safe_work_identities(self) -> None:
+        files = [
+            record(self.folder, "015.1080p.mkv"),
+            record(self.folder, "015.720p.mp4"),
+        ]
+        score, reason = compare_records(files[0], files[1])
+        self.assertEqual(score, 0.0)
+        self.assertIn("信息不足", reason)
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_different_episode_only_ids_do_not_match(self) -> None:
+        files = [
+            record(self.folder, "The.Show.E07.1080p.mkv"),
+            record(self.folder, "The.Show.E08.1080p.mp4"),
+        ]
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_shared_website_brand_with_different_ids_does_not_match(self) -> None:
+        files = [
+            record(self.folder, "2048社区 - fun2048.com@fc1298546.mp4"),
+            record(self.folder, "2048社区 - fun2048.com@fc1356110.mp4"),
+        ]
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_matching_progress_reports_exact_remaining_comparisons(self) -> None:
+        files = [
+            record(self.folder, "MIDA-630.mp4"),
+            record(self.folder, "MIDA-630-C.mov"),
+            record(self.folder, "MIDA-630-4k.mkv"),
+        ]
+        updates = []
+        groups = group_similar_files(files, progress=updates.append)
+        comparison_updates = [
+            state for state in updates
+            if isinstance(state, MatchingProgressState)
+            and state.phase == "核对作品身份"
+        ]
+        self.assertEqual(len(groups), 1)
+        self.assertTrue(comparison_updates)
+        final = comparison_updates[-1]
+        self.assertEqual(final.total_items, 3)
+        self.assertEqual(final.processed_items, 3)
+        self.assertEqual(final.remaining_items, 0)
+        self.assertEqual(final.percent, 100.0)
+        self.assertEqual(final.eta_seconds, 0.0)
+
+    def test_matching_honors_pre_cancelled_event(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+        files = [record(self.folder, "寒战.mkv"), record(self.folder, "寒战1.mp4")]
+        self.assertEqual(group_similar_files(files, cancel_event=cancel_event), [])
 
 
 

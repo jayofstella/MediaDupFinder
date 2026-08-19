@@ -42,6 +42,15 @@ class MetadataSafetyTests(unittest.TestCase):
         self.assertEqual(sum(item.action == "删除" for item in group.files), 0)
         self.assertEqual(sum(item.action == "保留" for item in group.files), 1)
 
+    def test_three_percent_duration_difference_already_requires_review(self) -> None:
+        group = DuplicateGroup("g", [
+            record(self.folder, "电影.mp4", 3600),
+            record(self.folder, "电影-4k.mkv", 3750),
+        ], 0.9, "作品身份相同")
+        assess_group_metadata(group)
+        self.assertTrue(group.safety_warning)
+        self.assertIn("2.5 分钟", group.metadata_note)
+
     def test_hash_only_group_does_not_need_duration_review(self) -> None:
         files = [
             record(self.folder, "a.mp4", 3600),
@@ -57,4 +66,3 @@ class MetadataSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

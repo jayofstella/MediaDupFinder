@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -44,8 +45,31 @@ _DOMAIN_RE = re.compile(
     r"(?:com|net|org|tv|cc|cn|me|io|xyz|site|info|club|top|co|uk|jp)"
     r"(?::\d+)?(?:/[^\s\[\]【】()]*)?"
 )
-_AT_GROUP_RE = re.compile(r"(?i)(?:^|[\s._\-\[\]【】])@[a-z0-9\u3400-\u9fff-]{2,30}")
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+_FULL_DATE_RE = re.compile(
+    r"(?i)(?<!\d)(?P<year>(?:19|20)\d{2}|\d{2})[\s._-]+"
+    r"(?P<month>0?[1-9]|1[0-2])[\s._-]+"
+    r"(?P<day>0?[1-9]|[12]\d|3[01])(?!\d)"
+)
+_COMPACT_DATE_RE = re.compile(
+    r"(?i)(?:^|[\s._-])(?P<date>(?:19|20)\d{6})(?=$|[\s._-])"
+)
+_SEASON_EPISODE_RE = re.compile(
+    r"(?i)(?:^|[\s._-])s(?:eason)?[\s._-]*0*(\d{1,2})"
+    r"[\s._-]*e(?:pisode)?[\s._-]*0*(\d{1,3})(?=$|[\s._-])"
+)
+_X_EPISODE_RE = re.compile(
+    r"(?i)(?:^|[\s._-])0*(\d{1,2})x0*(\d{1,3})(?=$|[\s._-])"
+)
+_EPISODE_ONLY_RE = re.compile(
+    r"(?i)(?:^|[\s._-])(?:e|ep|episode)[\s._-]*0*(\d{1,4})(?=$|[\s._-])"
+)
+_CHINESE_EPISODE_RE = re.compile(
+    r"(?:^|[\s._-])第\s*0*(\d{1,4})\s*集(?=$|[\s._-])"
+)
+_SITE_BRAND_RE = re.compile(
+    r"(?i)(?:^|[\s._-])(?:big|fun)?\d{3,5}(?:社区|论坛|論壇)(?=$|[\s._-])"
+)
 _ROMAN_TOKEN_RE = re.compile(
     r"(?i)(?<![a-z0-9])(x|ix|viii|vii|vi|v|iv|iii|ii|i)(?![a-z0-9])"
 )
@@ -107,6 +131,11 @@ class NormalizedName:
     part_marker: Optional[str] = None
     years: Tuple[int, ...] = ()
     tokens: Tuple[str, ...] = ()
+    identity_kind: str = "title"
+    work_key: str = ""
+    series_key: Optional[str] = None
+    episode_date: Optional[str] = None
+    episode_id: Optional[str] = None
 
 
 def _normalize_serial(digits: str) -> str:
@@ -123,6 +152,11 @@ def _valid_catalog(
     folded = prefix.casefold()
     if folded in _NON_CATALOG_PREFIXES:
         return False
+    # Short dot/space-separated numbers are very often a date fragment or a
+    # series episode number. Keep short catalog numbers only when an explicit
+    # hyphen is present, for example ABC-1.
+    if len(digits) < 3 and not compact and "-" not in separator:
+        return False
     if digits in {"2160", "1440", "1080", "720", "576", "480", "360"}:
         if following in {"p", "i"} or folded in {"video", "movie", "film", "uhd"}:
             return False
@@ -135,18 +169,23 @@ def _valid_catalog(
     return True
 
 
-def _catalog_key(text: str) -> Optional[str]:
+def _catalog_identity(text: str) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     fc2 = _FC2_RE.search(text)
     if fc2:
-        return "fc2-ppv-{}".format(_normalize_serial(fc2.group(1)))
+        return "fc2-ppv-{}".format(_normalize_serial(fc2.group(1))), fc2.span()
     streaming = _STREAMING_RE.search(text)
     if streaming:
-        return "{}-{}-{}".format(
-            streaming.group(1).casefold(), streaming.group(2), _normalize_serial(streaming.group(3))
+        return (
+            "{}-{}-{}".format(
+                streaming.group(1).casefold(),
+                streaming.group(2),
+                _normalize_serial(streaming.group(3)),
+            ),
+            streaming.span(),
         )
     tokyo_hot = _TOKYO_HOT_RE.search(text)
     if tokyo_hot:
-        return "tokyo-hot-n{}".format(_normalize_serial(tokyo_hot.group(1)))
+        return "tokyo-hot-n{}".format(_normalize_serial(tokyo_hot.group(1))), tokyo_hot.span()
 
     for pattern in (_CATALOG_SEPARATED_RE, _CATALOG_COMPACT_RE):
         compact = pattern is _CATALOG_COMPACT_RE
@@ -156,17 +195,34 @@ def _catalog_key(text: str) -> Optional[str]:
             following = text[match.end():match.end() + 1].casefold()
             separator = "" if compact else text[match.end(1):match.start(2)]
             if _valid_catalog(prefix, digits, following, separator, compact):
-                return "{}-{}".format(prefix, _normalize_serial(digits))
-    return None
+                return "{}-{}".format(prefix, _normalize_serial(digits)), match.span()
+    return None, None
 
 
-def _part_marker(text: str) -> Optional[str]:
+def _catalog_key(text: str) -> Optional[str]:
+    return _catalog_identity(text)[0]
+
+
+def _part_marker(
+    text: str,
+    catalog_span: Optional[Tuple[int, int]] = None,
+) -> Optional[str]:
     match = _PART_RE.search(text)
     if match:
         return "part{}".format(int(match.group(1)))
     chinese = _CHINESE_PART_RE.search(text)
     if chinese:
         return "segment:{}".format(re.sub(r"\s+", "", chinese.group(1)))
+    if catalog_span:
+        tail = text[catalog_span[1]:]
+        meaningful = [
+            token for token in re.split(r"[^0-9a-z\u3400-\u9fff]+", tail)
+            if token and not _is_noise_token(token)
+        ]
+        if len(meaningful) == 1 and re.fullmatch(r"0*[1-9][0-9]?", meaningful[0]):
+            return "part{}".format(int(meaningful[0]))
+        if len(meaningful) == 1 and meaningful[0].casefold() in {"a", "b"}:
+            return "segment:{}".format(meaningful[0].casefold().upper())
     return None
 
 
@@ -218,6 +274,143 @@ def _is_noise_token(token: str) -> bool:
     return any(pattern.match(folded) for pattern in _NOISE_PATTERNS)
 
 
+@dataclass(frozen=True)
+class _EpisodeIdentity:
+    kind: str
+    series_key: str
+    episode_date: Optional[str]
+    episode_id: Optional[str]
+    title_tokens: Tuple[str, ...]
+    primary: str
+    display: str
+
+
+def _meaningful_tokens(fragment: str) -> Tuple[str, ...]:
+    value = _SITE_BRAND_RE.sub(" ", fragment)
+    value = _strip_promotional_affixes(value.translate(_BRACKETS))
+    return tuple(
+        token.casefold()
+        for token in re.split(r"[^0-9a-z\u3400-\u9fff]+", value)
+        if token and not _is_noise_token(token)
+    )
+
+
+def _normalize_two_or_four_digit_year(value: str) -> int:
+    year = int(value)
+    if len(value) == 2:
+        return 2000 + year if year <= 79 else 1900 + year
+    return year
+
+
+def _episode_identity(text: str) -> Optional[_EpisodeIdentity]:
+    """Recognize a concrete series episode before generic title matching."""
+
+    for match in _FULL_DATE_RE.finditer(text):
+        year = _normalize_two_or_four_digit_year(match.group("year"))
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        try:
+            episode_date = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        series_tokens = _meaningful_tokens(text[:match.start()])
+        if not series_tokens:
+            continue
+        title_tokens = _meaningful_tokens(text[match.end():])
+        series_key = "".join(series_tokens)
+        title_key = "".join(title_tokens)
+        primary = "date{}{}{}".format(
+            series_key,
+            episode_date.replace("-", ""),
+            title_key,
+        )
+        display = "{} · {}".format(" ".join(series_tokens), episode_date)
+        if title_tokens:
+            display += " · " + " ".join(title_tokens)
+        return _EpisodeIdentity(
+            kind="dated_episode",
+            series_key=series_key,
+            episode_date=episode_date,
+            episode_id=None,
+            title_tokens=title_tokens,
+            primary=primary,
+            display=display,
+        )
+
+    for match in _COMPACT_DATE_RE.finditer(text):
+        raw_date = match.group("date")
+        year = int(raw_date[:4])
+        month = int(raw_date[4:6])
+        day = int(raw_date[6:8])
+        try:
+            episode_date = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        series_tokens = _meaningful_tokens(text[:match.start()])
+        if not series_tokens:
+            continue
+        title_tokens = _meaningful_tokens(text[match.end():])
+        series_key = "".join(series_tokens)
+        title_key = "".join(title_tokens)
+        display = "{} · {}".format(" ".join(series_tokens), episode_date)
+        if title_tokens:
+            display += " · " + " ".join(title_tokens)
+        return _EpisodeIdentity(
+            kind="dated_episode",
+            series_key=series_key,
+            episode_date=episode_date,
+            episode_id=None,
+            title_tokens=title_tokens,
+            primary="date{}{}{}".format(
+                series_key, episode_date.replace("-", ""), title_key,
+            ),
+            display=display,
+        )
+
+    for pattern in (_SEASON_EPISODE_RE, _X_EPISODE_RE):
+        match = pattern.search(text)
+        if not match:
+            continue
+        series_tokens = _meaningful_tokens(text[:match.start()])
+        if not series_tokens:
+            continue
+        season = int(match.group(1))
+        episode = int(match.group(2))
+        episode_id = "s{:02d}e{:02d}".format(season, episode)
+        series_key = "".join(series_tokens)
+        title_tokens = _meaningful_tokens(text[match.end():])
+        return _EpisodeIdentity(
+            kind="series_episode",
+            series_key=series_key,
+            episode_date=None,
+            episode_id=episode_id,
+            title_tokens=title_tokens,
+            primary="episode{}{}".format(series_key, episode_id),
+            display="{} · {}".format(" ".join(series_tokens), episode_id.upper()),
+        )
+
+    for pattern in (_EPISODE_ONLY_RE, _CHINESE_EPISODE_RE):
+        match = pattern.search(text)
+        if not match:
+            continue
+        series_tokens = _meaningful_tokens(text[:match.start()])
+        if not series_tokens:
+            continue
+        episode_id = "e{:03d}".format(int(match.group(1)))
+        series_key = "".join(series_tokens)
+        title_tokens = _meaningful_tokens(text[match.end():])
+        return _EpisodeIdentity(
+            kind="series_episode",
+            series_key=series_key,
+            episode_date=None,
+            episode_id=episode_id,
+            title_tokens=title_tokens,
+            primary="episode{}{}".format(series_key, episode_id),
+            display="{} · {}".format(" ".join(series_tokens), episode_id.upper()),
+        )
+    return None
+
+
 def _extract_release_years(text: str, catalog: Optional[str]) -> Tuple[int, ...]:
     """Return the most likely release year, not every year-like title number."""
 
@@ -262,12 +455,17 @@ def normalize_stem(stem: str) -> NormalizedName:
     value = unicodedata.normalize("NFKC", stem).strip().casefold()
     value = simplify_for_matching(value)
     value = _DOMAIN_RE.sub(" ", value)
-    value = _AT_GROUP_RE.sub(" ", value)
+    # '@' is only a separator. Removing the whole following token discarded
+    # real identifiers such as @fc1298546 and collapsed unrelated works into
+    # one website-brand group.
+    value = value.replace("@", " ")
+    value = _SITE_BRAND_RE.sub(" ", value)
     value = _COMPOUND_NOISE_RE.sub(" ", value)
     value = _NOISE_PHRASE_RE.sub(" ", value)
     value = _convert_roman_suffix(value)
-    catalog = _catalog_key(value)
-    part = _part_marker(value)
+    episode = _episode_identity(value)
+    catalog, catalog_span = (None, None) if episode else _catalog_identity(value)
+    part = _part_marker(value, catalog_span)
     years = _extract_release_years(value, catalog)
     value = value.translate(_BRACKETS)
     value = _strip_promotional_affixes(value)
@@ -294,8 +492,25 @@ def normalize_stem(stem: str) -> NormalizedName:
         display = catalog.upper()
         years = ()
 
+    identity_kind = "catalog" if catalog else "title"
+    series_key = None
+    episode_date = None
+    episode_id = None
+    if episode:
+        identity_kind = episode.kind
+        series_key = episode.series_key
+        episode_date = episode.episode_date
+        episode_id = episode.episode_id
+        primary = episode.primary
+        display = episode.display
+        years = ()
+        normalized_tokens = (
+            episode.series_key,
+            (episode.episode_date or episode.episode_id or "").replace("-", ""),
+        ) + episode.title_tokens
+
     aliases = [primary]
-    if not catalog:
+    if not catalog and not episode:
         without_year = primary
         for year in years:
             marker = str(year)
@@ -319,6 +534,11 @@ def normalize_stem(stem: str) -> NormalizedName:
         part_marker=part,
         years=years,
         tokens=normalized_tokens,
+        identity_kind=identity_kind,
+        work_key=primary,
+        series_key=series_key,
+        episode_date=episode_date,
+        episode_id=episode_id,
     )
 
 

@@ -2,7 +2,7 @@
 
 ## Supported version
 
-当前维护版本：1.2.x。
+当前维护版本：1.5.x。
 
 ## Reporting
 
