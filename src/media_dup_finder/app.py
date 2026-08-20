@@ -36,8 +36,26 @@ from .locations import (
 )
 from .matching import MatchingProgressState, group_similar_files
 from .metadata import assess_group_metadata, find_ffprobe, probe_records
-from .models import DuplicateGroup, FileRecord, ScanResult, VIDEO_EXTENSIONS
+from .models import (
+    DuplicateGroup,
+    FileRecord,
+    ScanResult,
+    ScanStatistics,
+    VIDEO_EXTENSIONS,
+)
 from .operations import DeletionResult, send_to_recycle_bin
+from .scan_filters import (
+    SCOPE_ALL,
+    SCOPE_DIFFERENT_FOLDER,
+    SCOPE_DIFFERENT_ROOT,
+    SCOPE_SAME_FOLDER,
+    format_megabytes_setting,
+    megabytes_to_bytes,
+    parse_exclude_keywords,
+    parse_extensions,
+    parse_maximum_size_mb,
+    parse_minimum_size_mb,
+)
 from .scanner import scan_directories
 from .settings import load_settings, save_settings
 from .utils import format_bytes, format_duration
@@ -48,13 +66,65 @@ SIMILARITY_MODES: Dict[str, float] = {
     "标准作品识别": 0.89,
     "兼容轻微拼写差异": 0.86,
 }
-FILE_MODES = ("视频文件（推荐）", "全部文件")
+FILE_MODES = ("视频文件（推荐）", "自定义扩展名", "全部文件")
 HASH_MODES: Dict[str, str] = {
     "智能扫描（推荐）": HASH_MODE_SMART,
     "完整扫描（较慢）": HASH_MODE_DEEP,
     "关闭 MD5 扫描": HASH_MODE_OFF,
 }
 HASH_MODE_LABELS = {value: key for key, value in HASH_MODES.items()}
+COMPARISON_SCOPES: Dict[str, str] = {
+    "全部文件互相比对（推荐）": SCOPE_ALL,
+    "只比较不同所在目录": SCOPE_DIFFERENT_FOLDER,
+    "只比较同一所在目录": SCOPE_SAME_FOLDER,
+    "只比较不同扫描根目录/盘符": SCOPE_DIFFERENT_ROOT,
+}
+COMPARISON_SCOPE_LABELS = {value: key for key, value in COMPARISON_SCOPES.items()}
+
+GROUP_COLUMNS = (
+    "name", "kind", "count", "exact_sets", "saving", "duration_span", "confidence",
+)
+DETAIL_COLUMNS = (
+    "action", "name", "work", "identity", "source", "segment", "relation",
+    "size", "resolution", "duration", "format", "codec", "md5", "hash_status",
+    "modified", "folder",
+)
+
+
+def normalize_column_order(value: object, defaults: Sequence[str]) -> List[str]:
+    """Keep every known column exactly once while honoring saved order."""
+
+    known = set(defaults)
+    if not isinstance(value, (list, tuple)):
+        return list(defaults)
+    ordered = []
+    for raw in value:
+        column = str(raw)
+        if column in known and column not in ordered:
+            ordered.append(column)
+    ordered.extend(column for column in defaults if column not in ordered)
+    return ordered
+
+
+def exact_md5_subgroup_count(group: DuplicateGroup) -> int:
+    counts: Dict[str, int] = {}
+    for record in group.files:
+        if record.content_md5:
+            counts[record.content_md5] = counts.get(record.content_md5, 0) + 1
+    return sum(count >= 2 for count in counts.values())
+
+
+def content_relation_label(record: FileRecord, group: DuplicateGroup) -> str:
+    if record.content_md5:
+        count = sum(
+            item.content_md5 == record.content_md5 for item in group.files
+        )
+        if count >= 2:
+            return "MD5相同 ×{}（{}…）".format(count, record.content_md5[:8])
+        return "MD5已验证（组内不同）"
+    if record.hash_source == "快速指纹不同，跳过完整 MD5":
+        return "快速指纹不同"
+    return "作品身份相似（内容未确认）"
 
 
 def format_matching_progress_text(state: MatchingProgressState) -> str:
@@ -90,11 +160,36 @@ def format_matching_progress_text(state: MatchingProgressState) -> str:
     )
 
 
+def format_scan_filter_summary(statistics: ScanStatistics) -> str:
+    details = []
+    values = (
+        (statistics.skipped_too_small, "小文件"),
+        (statistics.skipped_too_large, "超大文件"),
+        (statistics.skipped_extension, "非目标类型"),
+        (statistics.skipped_hidden_system_files, "隐藏/系统文件"),
+        (statistics.skipped_incomplete, "临时/未完成文件"),
+        (statistics.skipped_keyword, "关键字排除"),
+    )
+    for count, label in values:
+        if count:
+            details.append("{} {}".format(label, count))
+    if statistics.skipped_hidden_system_directories:
+        details.append(
+            "隐藏/系统目录 {}".format(statistics.skipped_hidden_system_directories)
+        )
+    if statistics.skipped_excluded_directories:
+        details.append("排除目录 {}".format(statistics.skipped_excluded_directories))
+    if not details:
+        return "未筛除文件"
+    return "、".join(details)
+
+
 IDENTITY_KIND_LABELS = {
     "catalog": "作品编号",
     "dated_episode": "系列日期单集",
     "series_episode": "季集编号",
     "title": "影视标题",
+    "generic_media": "光盘通用文件名",
 }
 
 
@@ -106,6 +201,8 @@ def format_part_marker(marker: Optional[str]) -> str:
     if marker.startswith("segment:"):
         value = marker.split(":", 1)[1]
         return "{} 段".format(value) if value in {"A", "B"} else value
+    if marker.startswith("disc:"):
+        return "光盘段 {}".format(marker.split(":", 1)[1].upper())
     return marker
 
 
@@ -139,7 +236,9 @@ def sort_records_for_display(
             "identity": IDENTITY_KIND_LABELS.get(
                 record.name_info.identity_kind, record.name_info.identity_kind,
             ),
+            "source": record.name_info.identity_source,
             "segment": record.name_info.part_marker or "",
+            "relation": record.content_md5 or record.hash_source,
             "size": record.size,
             "resolution": (
                 (record.width or (height * 16 // 9)) * height if height else None
@@ -175,6 +274,7 @@ def sort_groups_for_display(
             "name": group.display_name.casefold(),
             "kind": group_identity_basis_label(group),
             "count": len(group.files),
+            "exact_sets": exact_md5_subgroup_count(group),
             "saving": group.estimated_savings,
             "duration_span": group.duration_span_seconds,
             "confidence": group.confidence,
@@ -249,9 +349,14 @@ def build_file_information(record: FileRecord, group: DuplicateGroup) -> str:
         "【哈希信息】",
         "完整 MD5：{}".format(md5),
         "MD5 状态：{}".format(record.hash_source),
+        "组内内容关系：{}".format(content_relation_label(record, group)),
         "",
         "【名称解析】",
         "身份类型：{}".format(identity_kind),
+        "身份来源：{}（{}）".format(
+            record.name_info.identity_source,
+            record.name_info.source_text or record.path.stem,
+        ),
         "识别作品：{}".format(record.name_info.cleaned_display),
         "作品身份键：{}".format(record.name_info.work_key or "无"),
         "作品编号：{}".format(catalog),
@@ -280,9 +385,9 @@ def build_file_information(record: FileRecord, group: DuplicateGroup) -> str:
 
 REPORT_COLUMNS = (
     "候选组", "候选作品", "身份/依据", "匹配原因", "辅助提示", "重点复核",
-    "置信度", "决定", "文件名", "识别作品", "身份类型", "作品身份键",
+    "置信度", "决定", "文件名", "识别作品", "身份类型", "身份来源", "来源文本", "作品身份键",
     "作品编号", "分段标记", "系列名称键", "单集日期", "季集编号",
-    "完整路径", "所在目录", "大小(字节)", "MD5", "MD5状态", "分辨率",
+    "完整路径", "所在目录", "大小(字节)", "MD5", "MD5状态", "内容关系", "分辨率",
     "时长(秒)", "编码", "格式", "修改时间",
 )
 
@@ -305,6 +410,8 @@ def build_report_row(
         record.path.name,
         info.cleaned_display,
         IDENTITY_KIND_LABELS.get(info.identity_kind, info.identity_kind),
+        info.identity_source,
+        info.source_text,
         info.work_key,
         info.catalog_key or "",
         format_part_marker(info.part_marker) if info.part_marker else "",
@@ -316,6 +423,7 @@ def build_report_row(
         record.size,
         record.content_md5 or "",
         record.hash_source,
+        content_relation_label(record, group),
         record.resolution,
         "" if record.duration_seconds is None else round(record.duration_seconds, 2),
         record.codec or "",
@@ -503,6 +611,170 @@ class BatchDirectoryDialog:
         return self.result
 
 
+class ExcludedDirectoriesDialog:
+    """Manage directories that traversal must skip completely."""
+
+    def __init__(self, parent: tk.Misc, existing: Sequence[str]) -> None:
+        self.result: Optional[List[str]] = None
+        self.window = tk.Toplevel(parent)
+        self.window.title("管理排除目录")
+        self.window.geometry("720x430")
+        self.window.minsize(580, 360)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="这些目录及其全部子目录都不会扫描。适合缓存、下载临时目录或不希望参与比对的位置。",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(
+            body, selectmode=tk.EXTENDED, exportselection=False, activestyle="none",
+        )
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
+        scroll.pack(side="left", fill="y")
+        self.listbox.configure(yscrollcommand=scroll.set)
+        for value in existing:
+            self.listbox.insert(tk.END, value)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(side="right", fill="y", padx=(8, 0))
+        ttk.Button(buttons, text="批量添加…", command=self._add).pack(fill="x")
+        ttk.Button(buttons, text="移除所选", command=self._remove).pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="清空", command=lambda: self.listbox.delete(0, tk.END)).pack(
+            fill="x", pady=(6, 0)
+        )
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(actions, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(
+            actions, text="确定", style="Accent.TButton", command=self._accept,
+        ).pack(side="right", padx=(0, 7))
+
+    def _add(self) -> None:
+        current = list(self.listbox.get(0, tk.END))
+        selected = BatchDirectoryDialog(self.window, current).show()
+        if selected:
+            for value in selected:
+                self.listbox.insert(tk.END, value)
+
+    def _remove(self) -> None:
+        for index in reversed(self.listbox.curselection()):
+            self.listbox.delete(index)
+
+    def _accept(self) -> None:
+        self.result = merge_unique_directory_paths(list(self.listbox.get(0, tk.END)))
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> Optional[List[str]]:
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
+
+
+class ColumnOrderDialog:
+    """Let users move every result column left or right."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        order: Sequence[str],
+        labels: Dict[str, str],
+        defaults: Sequence[str],
+    ) -> None:
+        self.labels = labels
+        self.defaults = list(defaults)
+        self.result: Optional[List[str]] = None
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry("470x520")
+        self.window.minsize(410, 420)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="列表从上到下对应表格从左到右；所有列仍可点击标题排序。",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(body, exportselection=False, activestyle="dotbox")
+        self.listbox.pack(side="left", fill="both", expand=True)
+        buttons = ttk.Frame(body)
+        buttons.pack(side="right", fill="y", padx=(8, 0))
+        ttk.Button(buttons, text="向左移动", command=lambda: self._move(-1)).pack(fill="x")
+        ttk.Button(buttons, text="向右移动", command=lambda: self._move(1)).pack(
+            fill="x", pady=(6, 0)
+        )
+        ttk.Button(buttons, text="恢复默认", command=self._reset).pack(
+            fill="x", pady=(16, 0)
+        )
+        self.order = normalize_column_order(order, defaults)
+        self._refresh(0)
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(actions, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(
+            actions, text="应用", style="Accent.TButton", command=self._accept,
+        ).pack(side="right", padx=(0, 7))
+
+    def _refresh(self, selected: int) -> None:
+        self.listbox.delete(0, tk.END)
+        for index, column in enumerate(self.order, start=1):
+            self.listbox.insert(tk.END, "{:>2}.  {}".format(index, self.labels[column]))
+        if self.order:
+            selected = max(0, min(selected, len(self.order) - 1))
+            self.listbox.selection_set(selected)
+            self.listbox.see(selected)
+
+    def _move(self, direction: int) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        target = index + direction
+        if target < 0 or target >= len(self.order):
+            return
+        self.order[index], self.order[target] = self.order[target], self.order[index]
+        self._refresh(target)
+
+    def _reset(self) -> None:
+        self.order = list(self.defaults)
+        self._refresh(0)
+
+    def _accept(self) -> None:
+        self.result = list(self.order)
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> Optional[List[str]]:
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
+
+
 class MediaDupFinderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -520,11 +792,24 @@ class MediaDupFinderApp:
         self.group_sort_reverse = True
         self.detail_sort_column = "size"
         self.detail_sort_reverse = True
+        saved_exclusions = self.settings.get("excluded_directories", [])
+        if not isinstance(saved_exclusions, list):
+            saved_exclusions = []
+        self.excluded_directories = [
+            str(value) for value in saved_exclusions
+            if str(value).strip()
+        ]
+        self.group_column_order = normalize_column_order(
+            self.settings.get("group_column_order"), GROUP_COLUMNS,
+        )
+        self.detail_column_order = normalize_column_order(
+            self.settings.get("detail_column_order"), DETAIL_COLUMNS,
+        )
 
         self.root.title("{} v{}".format(__app_name__, __version__))
         self._set_window_icon()
-        self.root.geometry(str(self.settings.get("window_geometry") or "1180x760"))
-        self.root.minsize(940, 620)
+        self.root.geometry(str(self.settings.get("window_geometry") or "1280x820"))
+        self.root.minsize(980, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._configure_style()
         self._build_menu()
@@ -566,6 +851,7 @@ class MediaDupFinderApp:
         menu = tk.Menu(self.root)
         file_menu = tk.Menu(menu, tearoff=False)
         file_menu.add_command(label="批量添加扫描目录…", command=self.add_directory)
+        file_menu.add_command(label="管理排除目录…", command=self.manage_excluded_directories)
         file_menu.add_command(label="导出当前报告…", command=self.export_report)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
@@ -577,6 +863,15 @@ class MediaDupFinderApp:
         action_menu.add_command(label="全部组智能选择", command=self.smart_select_all)
         action_menu.add_command(label="清除全部选择", command=self.clear_all_actions)
         menu.add_cascade(label="操作", menu=action_menu)
+
+        view_menu = tk.Menu(menu, tearoff=False)
+        view_menu.add_command(
+            label="候选组列顺序…", command=lambda: self.customize_columns("group"),
+        )
+        view_menu.add_command(
+            label="组内文件列顺序…", command=lambda: self.customize_columns("detail"),
+        )
+        menu.add_cascade(label="视图", menu=view_menu)
 
         help_menu = tk.Menu(menu, tearoff=False)
         help_menu.add_command(label="使用说明", command=self.show_help)
@@ -630,12 +925,22 @@ class MediaDupFinderApp:
         controls.pack(fill="x", pady=(0, 8))
         options = ttk.LabelFrame(controls, text=" 2. 扫描设置 ", padding=(8, 7))
         options.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        options.columnconfigure(5, weight=1)
 
         self.recursive_var = tk.BooleanVar(value=True)
         self.metadata_var = tk.BooleanVar(value=True)
         self.hash_mode_var = tk.StringVar(value="智能扫描（推荐）")
         self.mode_var = tk.StringVar(value="严格作品识别（推荐）")
         self.file_mode_var = tk.StringVar(value=FILE_MODES[0])
+        self.name_matching_var = tk.BooleanVar(value=True)
+        self.comparison_scope_var = tk.StringVar(value="全部文件互相比对（推荐）")
+        self.min_size_mb_var = tk.StringVar(value="0")
+        self.max_size_mb_var = tk.StringVar(value="0")
+        self.skip_hidden_system_var = tk.BooleanVar(value=True)
+        self.skip_incomplete_var = tk.BooleanVar(value=True)
+        self.exclude_keywords_var = tk.StringVar(value="")
+        self.custom_extensions_var = tk.StringVar(value="mp4;mkv;avi;mov;vob;m2ts")
+        self.excluded_count_var = tk.StringVar(value="已排除 0 个目录")
         self.recursive_check = ttk.Checkbutton(options, text="包含子目录", variable=self.recursive_var)
         self.recursive_check.grid(
             row=0, column=0, sticky="w", padx=(0, 14)
@@ -674,6 +979,96 @@ class MediaDupFinderApp:
             style="Subtitle.TLabel",
         ).grid(row=1, column=3, columnspan=3, sticky="e", pady=(6, 0))
 
+        self.name_matching_check = ttk.Checkbutton(
+            options,
+            text="启用作品身份比对",
+            variable=self.name_matching_var,
+        )
+        self.name_matching_check.grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(7, 0)
+        )
+        ttk.Label(options, text="比对范围：").grid(
+            row=2, column=2, sticky="e", pady=(7, 0)
+        )
+        self.comparison_scope_combo = ttk.Combobox(
+            options,
+            textvariable=self.comparison_scope_var,
+            values=tuple(COMPARISON_SCOPES),
+            state="readonly",
+            width=23,
+        )
+        self.comparison_scope_combo.grid(
+            row=2, column=3, sticky="w", padx=(0, 14), pady=(7, 0)
+        )
+        ttk.Label(options, text="忽略小于：").grid(
+            row=2, column=4, sticky="e", pady=(7, 0)
+        )
+        minimum_frame = ttk.Frame(options)
+        minimum_frame.grid(row=2, column=5, sticky="w", pady=(7, 0))
+        self.min_size_entry = ttk.Entry(
+            minimum_frame, textvariable=self.min_size_mb_var, width=9,
+        )
+        self.min_size_entry.pack(side="left")
+        ttk.Label(minimum_frame, text=" MB（0=不限制）").pack(side="left")
+
+        self.skip_hidden_system_check = ttk.Checkbutton(
+            options,
+            text="跳过隐藏/系统文件与目录（推荐）",
+            variable=self.skip_hidden_system_var,
+        )
+        self.skip_hidden_system_check.grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(7, 0)
+        )
+        self.skip_incomplete_check = ttk.Checkbutton(
+            options,
+            text="跳过临时或未完成下载文件",
+            variable=self.skip_incomplete_var,
+        )
+        self.skip_incomplete_check.grid(
+            row=3, column=2, columnspan=2, sticky="w", pady=(7, 0)
+        )
+        ttk.Label(options, text="排除文件名关键字：").grid(
+            row=3, column=4, sticky="e", pady=(7, 0)
+        )
+        self.exclude_keywords_entry = ttk.Entry(
+            options, textvariable=self.exclude_keywords_var, width=27,
+        )
+        self.exclude_keywords_entry.grid(
+            row=3, column=5, sticky="ew", pady=(7, 0)
+        )
+        ttk.Label(
+            options,
+            text="多个关键字用逗号或分号分隔，例如：sample; trailer; 预告",
+            style="Subtitle.TLabel",
+        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+        ttk.Label(options, text="最大文件：").grid(
+            row=4, column=0, sticky="e", pady=(7, 0)
+        )
+        maximum_frame = ttk.Frame(options)
+        maximum_frame.grid(row=4, column=1, sticky="w", pady=(7, 0))
+        self.max_size_entry = ttk.Entry(
+            maximum_frame, textvariable=self.max_size_mb_var, width=9,
+        )
+        self.max_size_entry.pack(side="left")
+        ttk.Label(maximum_frame, text=" MB（0=不限制）").pack(side="left")
+        ttk.Label(options, text="自定义扩展名：").grid(
+            row=4, column=2, sticky="e", pady=(7, 0)
+        )
+        self.custom_extensions_entry = ttk.Entry(
+            options, textvariable=self.custom_extensions_var, width=25,
+        )
+        self.custom_extensions_entry.grid(
+            row=4, column=3, sticky="ew", padx=(0, 14), pady=(7, 0)
+        )
+        self.excluded_button = ttk.Button(
+            options, text="管理排除目录…", command=self.manage_excluded_directories,
+        )
+        self.excluded_button.grid(row=4, column=4, sticky="e", pady=(7, 0))
+        ttk.Label(
+            options, textvariable=self.excluded_count_var, style="Subtitle.TLabel",
+        ).grid(row=4, column=5, sticky="w", pady=(7, 0))
+
         scan_actions = ttk.LabelFrame(controls, text=" 3. 开始 ", padding=(8, 7))
         scan_actions.pack(side="right", fill="y")
         self.scan_button = ttk.Button(
@@ -693,14 +1088,23 @@ class MediaDupFinderApp:
         paned.add(left, weight=2)
         paned.add(right, weight=5)
 
-        ttk.Label(left, text="同作品候选组（点击列标题排序）").pack(anchor="w", pady=(0, 4))
+        group_title = ttk.Frame(left)
+        group_title.pack(fill="x", pady=(0, 4))
+        ttk.Label(group_title, text="同作品候选组（点击列标题排序）").pack(side="left")
+        self.group_columns_button = ttk.Button(
+            group_title,
+            text="列顺序…",
+            command=lambda: self.customize_columns("group"),
+        )
+        self.group_columns_button.pack(side="right", padx=(4, 5))
         group_frame = ttk.Frame(left)
         group_frame.pack(fill="both", expand=True, padx=(0, 5))
         group_frame.rowconfigure(0, weight=1)
         group_frame.columnconfigure(0, weight=1)
         self.group_tree = ttk.Treeview(
             group_frame,
-            columns=("name", "kind", "count", "saving", "duration_span", "confidence"),
+            columns=GROUP_COLUMNS,
+            displaycolumns=tuple(self.group_column_order),
             show="headings",
             selectmode="browse",
         )
@@ -708,6 +1112,7 @@ class MediaDupFinderApp:
             "name": "识别作品",
             "kind": "身份/依据",
             "count": "数量",
+            "exact_sets": "MD5子组",
             "saving": "可释放",
             "duration_span": "时长差",
             "confidence": "置信度",
@@ -721,6 +1126,7 @@ class MediaDupFinderApp:
         self.group_tree.column("name", width=150, minwidth=100, anchor="w")
         self.group_tree.column("kind", width=82, minwidth=72, anchor="center", stretch=False)
         self.group_tree.column("count", width=48, minwidth=44, anchor="center", stretch=False)
+        self.group_tree.column("exact_sets", width=66, minwidth=58, anchor="center", stretch=False)
         self.group_tree.column("saving", width=78, minwidth=66, anchor="e", stretch=False)
         self.group_tree.column("duration_span", width=68, minwidth=60, anchor="center", stretch=False)
         self.group_tree.column("confidence", width=62, minwidth=56, anchor="center", stretch=False)
@@ -740,6 +1146,12 @@ class MediaDupFinderApp:
         detail_title = ttk.Frame(right)
         detail_title.pack(fill="x", pady=(0, 4))
         ttk.Label(detail_title, text="组内文件（可多选；点击任意列排序）").pack(side="left")
+        self.detail_columns_button = ttk.Button(
+            detail_title,
+            text="列顺序…",
+            command=lambda: self.customize_columns("detail"),
+        )
+        self.detail_columns_button.pack(side="left", padx=(7, 0))
         self.reason_label = ttk.Label(detail_title, text="", style="Subtitle.TLabel")
         self.reason_label.pack(side="right")
 
@@ -747,30 +1159,34 @@ class MediaDupFinderApp:
         detail_frame.pack(fill="both", expand=True)
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
-        columns = (
-            "action", "name", "work", "identity", "segment", "size", "resolution",
-            "duration", "format", "codec", "md5", "hash_status", "modified", "folder",
-        )
+        columns = DETAIL_COLUMNS
         self.detail_tree = ttk.Treeview(
-            detail_frame, columns=columns, show="headings", selectmode="extended",
+            detail_frame,
+            columns=columns,
+            displaycolumns=tuple(self.detail_column_order),
+            show="headings",
+            selectmode="extended",
         )
         headings = {
             "action": "决定", "name": "文件名", "work": "识别作品",
-            "identity": "身份类型", "segment": "分段",
+            "identity": "身份类型", "source": "身份来源", "segment": "分段",
+            "relation": "内容关系",
             "size": "大小", "resolution": "分辨率",
             "duration": "时长", "format": "格式", "codec": "编码", "md5": "MD5",
             "hash_status": "MD5状态", "modified": "修改时间", "folder": "所在目录",
         }
         self.detail_heading_labels = headings
         widths = {
-            "action": 66, "name": 230, "work": 170, "identity": 92, "segment": 76,
+            "action": 66, "name": 230, "work": 170, "identity": 92,
+            "source": 100, "segment": 96, "relation": 175,
             "size": 88, "resolution": 115,
             "duration": 70, "format": 56, "codec": 70, "md5": 92,
             "hash_status": 150, "modified": 130, "folder": 260,
         }
         anchors = {
             "action": "center", "size": "e", "resolution": "center",
-            "identity": "center", "segment": "center", "duration": "center", "format": "center",
+            "identity": "center", "source": "center", "segment": "center",
+            "duration": "center", "format": "center",
             "codec": "center", "md5": "center",
         }
         for column in columns:
@@ -847,6 +1263,10 @@ class MediaDupFinderApp:
             self.file_mode_combo, self.keep_button, self.delete_mark_button,
             self.pending_button, self.smart_button, self.open_button, self.execute_button,
             self.recursive_check, self.metadata_check, self.hash_mode_combo,
+            self.name_matching_check, self.comparison_scope_combo, self.min_size_entry,
+            self.max_size_entry, self.custom_extensions_entry, self.excluded_button,
+            self.skip_hidden_system_check, self.skip_incomplete_check,
+            self.exclude_keywords_entry, self.group_columns_button, self.detail_columns_button,
         ]
 
     def _restore_settings_to_ui(self) -> None:
@@ -856,6 +1276,32 @@ class MediaDupFinderApp:
         self.hash_mode_var.set(HASH_MODE_LABELS.get(hash_mode, "智能扫描（推荐）"))
         mode = str(self.settings.get("similarity_mode") or "严格作品识别（推荐）")
         self.mode_var.set(mode if mode in SIMILARITY_MODES else "严格作品识别（推荐）")
+        file_mode = str(self.settings.get("file_mode") or FILE_MODES[0])
+        self.file_mode_var.set(file_mode if file_mode in FILE_MODES else FILE_MODES[0])
+        self.name_matching_var.set(bool(self.settings.get("name_matching_enabled", True)))
+        comparison_scope = str(self.settings.get("comparison_scope") or SCOPE_ALL)
+        self.comparison_scope_var.set(
+            COMPARISON_SCOPE_LABELS.get(
+                comparison_scope, "全部文件互相比对（推荐）",
+            )
+        )
+        self.min_size_mb_var.set(
+            format_megabytes_setting(self.settings.get("min_size_mb", 0))
+        )
+        self.max_size_mb_var.set(
+            format_megabytes_setting(self.settings.get("max_size_mb", 0))
+        )
+        self.skip_hidden_system_var.set(
+            bool(self.settings.get("skip_hidden_system", True))
+        )
+        self.skip_incomplete_var.set(bool(self.settings.get("skip_incomplete", True)))
+        self.exclude_keywords_var.set(
+            str(self.settings.get("exclude_name_keywords") or "")
+        )
+        self.custom_extensions_var.set(
+            str(self.settings.get("custom_extensions") or "mp4;mkv;avi;mov;vob;m2ts")
+        )
+        self._update_excluded_count()
         for value in self.settings.get("last_roots", []):
             path = Path(str(value))
             if path.is_dir():
@@ -867,6 +1313,20 @@ class MediaDupFinderApp:
             "similarity_mode": self.mode_var.get(),
             "read_metadata": self.metadata_var.get(),
             "hash_mode": HASH_MODES.get(self.hash_mode_var.get(), HASH_MODE_SMART),
+            "file_mode": self.file_mode_var.get(),
+            "name_matching_enabled": self.name_matching_var.get(),
+            "comparison_scope": COMPARISON_SCOPES.get(
+                self.comparison_scope_var.get(), SCOPE_ALL,
+            ),
+            "min_size_mb": format_megabytes_setting(self.min_size_mb_var.get()),
+            "max_size_mb": format_megabytes_setting(self.max_size_mb_var.get()),
+            "skip_hidden_system": self.skip_hidden_system_var.get(),
+            "skip_incomplete": self.skip_incomplete_var.get(),
+            "exclude_name_keywords": self.exclude_keywords_var.get().strip(),
+            "custom_extensions": self.custom_extensions_var.get().strip(),
+            "excluded_directories": list(self.excluded_directories),
+            "group_column_order": list(self.group_column_order),
+            "detail_column_order": list(self.detail_column_order),
             "window_geometry": self.root.geometry(),
             "last_roots": list(self.root_list.get(0, tk.END)),
         }
@@ -887,6 +1347,54 @@ class MediaDupFinderApp:
     def remove_directories(self) -> None:
         for index in reversed(self.root_list.curselection()):
             self.root_list.delete(index)
+
+    def _update_excluded_count(self) -> None:
+        self.excluded_count_var.set(
+            "已排除 {} 个目录".format(len(self.excluded_directories))
+        )
+
+    def manage_excluded_directories(self) -> None:
+        if self.busy:
+            return
+        selected = ExcludedDirectoriesDialog(
+            self.root, self.excluded_directories,
+        ).show()
+        if selected is None:
+            return
+        self.excluded_directories = selected
+        self._update_excluded_count()
+        self.status_var.set(
+            "已设置 {} 个排除目录；下次扫描时生效。".format(len(selected))
+        )
+
+    def customize_columns(self, target: str) -> None:
+        if self.busy:
+            return
+        if target == "group":
+            selected = ColumnOrderDialog(
+                self.root,
+                "候选组列顺序",
+                self.group_column_order,
+                self.group_heading_labels,
+                GROUP_COLUMNS,
+            ).show()
+            if selected is not None:
+                self.group_column_order = selected
+                self.group_tree.configure(displaycolumns=tuple(selected))
+        else:
+            selected = ColumnOrderDialog(
+                self.root,
+                "组内文件列顺序",
+                self.detail_column_order,
+                self.detail_heading_labels,
+                DETAIL_COLUMNS,
+            ).show()
+            if selected is not None:
+                self.detail_column_order = selected
+                self.detail_tree.configure(displaycolumns=tuple(selected))
+        if selected is not None:
+            self._save_ui_settings()
+            self.status_var.set("列顺序已应用并保存。")
 
     def _set_busy(self, busy: bool, kind: str = "") -> None:
         self.busy = busy
@@ -956,9 +1464,61 @@ class MediaDupFinderApp:
         extensions: Optional[Iterable[str]] = None
         if self.file_mode_var.get() == "全部文件":
             extensions = []
+        elif self.file_mode_var.get() == "自定义扩展名":
+            try:
+                extensions = parse_extensions(self.custom_extensions_var.get())
+            except ValueError as exc:
+                messagebox.showerror("扩展名设置无效", str(exc))
+                self.custom_extensions_entry.focus_set()
+                return
+            if not extensions:
+                messagebox.showerror(
+                    "扩展名设置无效",
+                    "选择“自定义扩展名”时，请至少输入一个扩展名，例如 mp4;mkv;vob。",
+                )
+                self.custom_extensions_entry.focus_set()
+                return
         recursive = self.recursive_var.get()
         read_metadata = self.metadata_var.get()
         requested_hash_mode = HASH_MODES.get(self.hash_mode_var.get(), HASH_MODE_SMART)
+        name_matching_enabled = self.name_matching_var.get()
+        comparison_scope = COMPARISON_SCOPES.get(
+            self.comparison_scope_var.get(), SCOPE_ALL,
+        )
+        if comparison_scope == SCOPE_DIFFERENT_ROOT:
+            distinct_roots = {directory_identity(str(path)) for path in roots}
+            if len(distinct_roots) < 2:
+                messagebox.showwarning(
+                    "需要两个扫描根目录",
+                    "选择“只比较不同扫描根目录/盘符”时，请至少添加两个不同的扫描位置。",
+                )
+                return
+        try:
+            minimum_size_mb = parse_minimum_size_mb(self.min_size_mb_var.get())
+            maximum_size_mb = parse_maximum_size_mb(self.max_size_mb_var.get())
+        except ValueError as exc:
+            messagebox.showerror("文件大小设置无效", str(exc))
+            return
+        if maximum_size_mb and maximum_size_mb < minimum_size_mb:
+            messagebox.showerror(
+                "文件大小设置无效",
+                "最大文件大小不能小于“忽略小于”的最小文件大小。",
+            )
+            self.max_size_entry.focus_set()
+            return
+        minimum_size_bytes = megabytes_to_bytes(minimum_size_mb)
+        maximum_size_bytes = megabytes_to_bytes(maximum_size_mb)
+        exclude_keywords = parse_exclude_keywords(self.exclude_keywords_var.get())
+        skip_hidden_system = self.skip_hidden_system_var.get()
+        skip_incomplete = self.skip_incomplete_var.get()
+        if not name_matching_enabled and requested_hash_mode == HASH_MODE_OFF:
+            messagebox.showwarning(
+                "没有启用比对方式",
+                "“作品身份比对”和“MD5 扫描”不能同时关闭，请至少启用一种。",
+            )
+            return
+        self.min_size_mb_var.set(format_megabytes_setting(minimum_size_mb))
+        self.max_size_mb_var.set(format_megabytes_setting(maximum_size_mb))
         self.cancel_event.clear()
         self.files = []
         self.groups = []
@@ -968,39 +1528,82 @@ class MediaDupFinderApp:
         self._set_busy(True, "scan")
 
         def worker() -> None:
+            scan_statistics = ScanStatistics()
             try:
                 def scan_progress(count: int, location: str) -> None:
-                    self.events.put(("status", "已发现 {} 个文件，正在扫描：{}".format(count, location)))
+                    self.events.put((
+                        "status",
+                        "已保留 {} 个文件，已按设置过滤 {} 个，正在扫描：{}".format(
+                            count, scan_statistics.filtered_files, location,
+                        ),
+                    ))
 
                 files, warnings, cancelled = scan_directories(
                     roots=roots,
                     recursive=recursive,
                     extensions=extensions,
+                    min_size_bytes=minimum_size_bytes,
+                    max_size_bytes=maximum_size_bytes,
+                    skip_hidden_system=skip_hidden_system,
+                    skip_incomplete=skip_incomplete,
+                    exclude_name_keywords=exclude_keywords,
+                    excluded_directories=tuple(Path(value) for value in self.excluded_directories),
+                    statistics=scan_statistics,
                     cancel_event=self.cancel_event,
                     progress=scan_progress,
                 )
                 if cancelled:
-                    self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
+                    self.events.put(("scan_done", ScanResult(
+                        files=files,
+                        groups=[],
+                        warnings=warnings,
+                        cancelled=True,
+                        scan_statistics=scan_statistics,
+                        comparison_scope=comparison_scope,
+                        name_matching_enabled=name_matching_enabled,
+                    )))
                     return
 
-                self.events.put(("status", "已扫描 {} 个文件，正在解析作品身份…".format(len(files))))
+                self.events.put((
+                    "status",
+                    "已保留 {} 个文件（{}），正在准备比对…".format(
+                        len(files), format_scan_filter_summary(scan_statistics),
+                    ),
+                ))
 
                 def matching_progress(state: MatchingProgressState) -> None:
                     self.events.put(("matching_progress", state))
 
-                name_groups = group_similar_files(
-                    files,
-                    threshold=threshold,
-                    cancel_event=self.cancel_event,
-                    progress=matching_progress,
-                )
+                if name_matching_enabled:
+                    name_groups = group_similar_files(
+                        files,
+                        threshold=threshold,
+                        comparison_scope=comparison_scope,
+                        cancel_event=self.cancel_event,
+                        progress=matching_progress,
+                    )
+                else:
+                    name_groups = []
+                    self.events.put((
+                        "status", "作品身份比对已关闭，正在准备 MD5 扫描…",
+                    ))
                 if self.cancel_event.is_set():
-                    self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
+                    self.events.put(("scan_done", ScanResult(
+                        files=files,
+                        groups=[],
+                        warnings=warnings,
+                        cancelled=True,
+                        scan_statistics=scan_statistics,
+                        comparison_scope=comparison_scope,
+                        name_matching_enabled=name_matching_enabled,
+                    )))
                     return
                 exact_groups = []
                 effective_hash_mode = requested_hash_mode
                 hash_stats = HashScanStats(mode=effective_hash_mode)
-                workload = estimate_hash_workload(files, effective_hash_mode)
+                workload = estimate_hash_workload(
+                    files, effective_hash_mode, comparison_scope,
+                )
 
                 if effective_hash_mode != HASH_MODE_OFF:
                     self.events.put((
@@ -1018,13 +1621,22 @@ class MediaDupFinderApp:
                         find_exact_duplicate_groups(
                             files,
                             mode=effective_hash_mode,
+                            comparison_scope=comparison_scope,
                             cancel_event=self.cancel_event,
                             progress=hash_progress,
                         )
                     )
                     warnings.extend(hash_warnings)
                     if hash_cancelled:
-                        self.events.put(("scan_done", ScanResult(files, [], warnings, cancelled=True)))
+                        self.events.put(("scan_done", ScanResult(
+                            files=files,
+                            groups=[],
+                            warnings=warnings,
+                            cancelled=True,
+                            scan_statistics=scan_statistics,
+                            comparison_scope=comparison_scope,
+                            name_matching_enabled=name_matching_enabled,
+                        )))
                         return
                 groups = merge_duplicate_groups(name_groups, exact_groups)
 
@@ -1069,6 +1681,9 @@ class MediaDupFinderApp:
                         hash_candidate_files=hash_stats.candidate_files,
                         hash_bytes_read=hash_stats.total_bytes_read,
                         hash_cache_hits=hash_stats.cache_hits,
+                        scan_statistics=scan_statistics,
+                        comparison_scope=comparison_scope,
+                        name_matching_enabled=name_matching_enabled,
                     ),
                 ))
             except Exception as exc:  # UI boundary: preserve a useful traceback.
@@ -1127,18 +1742,36 @@ class MediaDupFinderApp:
                 format_bytes(result.hash_bytes_read),
                 result.hash_cache_hits,
             )
+        filter_count = result.scan_statistics.filtered_files
+        filter_detail = " · 筛除 {} 个".format(filter_count) if filter_count else ""
+        scope_label = COMPARISON_SCOPE_LABELS.get(
+            result.comparison_scope, "全部文件互相比对（推荐）",
+        ).replace("（推荐）", "")
+        channel_label = "作品身份 + MD5" if (
+            result.name_matching_enabled
+            and result.hash_mode in {HASH_MODE_SMART, HASH_MODE_DEEP}
+        ) else (
+            "作品身份" if result.name_matching_enabled else "仅 MD5"
+        )
         self.summary_label.configure(text=(
-            "扫描 {} 个文件 · 找到 {} 组 / {} 个候选 · 含 {} 个 MD5 组 · 预计可释放 {}{}"
+            "保留扫描 {} 个文件{} · 找到 {} 组 / {} 个候选 · 含 {} 个 MD5 组 · 预计可释放 {}{}"
             .format(
-                len(self.files), len(self.groups), candidate_count, hash_group_count,
-                format_bytes(savings), hash_detail,
+                len(self.files), filter_detail, len(self.groups), candidate_count,
+                hash_group_count, format_bytes(savings), hash_detail,
             )
         ))
         warning_text = "；{} 条路径警告".format(len(result.warnings)) if result.warnings else ""
+        filter_text = format_scan_filter_summary(result.scan_statistics)
         if self.groups:
-            self.status_var.set("扫描完成{}。请逐组检查，软件不会自动删除。".format(warning_text))
+            self.status_var.set(
+                "扫描完成{}。范围：{}；通道：{}；{}。请逐组检查，软件不会自动删除。"
+                .format(warning_text, scope_label, channel_label, filter_text)
+            )
         else:
-            self.status_var.set("扫描完成{}，未找到符合当前规则的同作品候选。".format(warning_text))
+            self.status_var.set(
+                "扫描完成{}，未找到符合当前规则的候选。范围：{}；通道：{}；{}。"
+                .format(warning_text, scope_label, channel_label, filter_text)
+            )
 
     def _handle_worker_error(self, payload: Tuple[str, str]) -> None:
         self._set_busy(False)
@@ -1152,7 +1785,7 @@ class MediaDupFinderApp:
         else:
             self.group_sort_column = column
             self.group_sort_reverse = column in {
-                "count", "saving", "duration_span", "confidence",
+                "count", "exact_sets", "saving", "duration_span", "confidence",
             }
         self._refresh_group_tree(self.current_group_id)
 
@@ -1200,6 +1833,7 @@ class MediaDupFinderApp:
                     group.display_name,
                     group_identity_basis_label(group),
                     len(group.files),
+                    exact_md5_subgroup_count(group) or "—",
                     format_bytes(group.estimated_savings),
                     format_duration(duration_span) if duration_span is not None else "—",
                     "{:.0f}%".format(group.confidence * 100),
@@ -1253,7 +1887,9 @@ class MediaDupFinderApp:
                     IDENTITY_KIND_LABELS.get(
                         record.name_info.identity_kind, record.name_info.identity_kind,
                     ),
+                    record.name_info.identity_source,
                     format_part_marker(record.name_info.part_marker),
+                    content_relation_label(record, group),
                     format_bytes(record.size),
                     record.resolution,
                     format_duration(record.duration_seconds),
@@ -1674,15 +2310,19 @@ class MediaDupFinderApp:
         messagebox.showinfo(
             "使用说明",
             "1. 点击“批量添加目录”，可一次勾选多个磁盘，也可添加文件夹或粘贴多行路径。\n"
-            "2. 左侧选择同作品候选组，右侧比较大小、时长、分辨率和格式；点击任意列标题即可排序。\n"
-            "3. 在文件行上右键，可查看完整信息、打开文件、定位目录或复制路径。\n"
-            "4. 手工设置保留/删除，或使用智能选择后再复核。\n"
-            "5. 点击“执行已标记删除”，文件默认进入 Windows 回收站。\n\n"
+            "2. 可设置最小/最大文件大小、自定义扩展名、排除目录、比对范围及隐藏/临时文件过滤。\n"
+            "3. 若只寻找字节完全相同文件，可关闭作品身份比对并保留智能或完整 MD5。\n"
+            "4. 左侧选择候选组，右侧比较内容关系、大小、时长、分辨率和格式；点击任意列标题即可排序。\n"
+            "5. 点击两侧的“列顺序”可把全部列向左或向右移动，设置会自动保存。\n"
+            "6. 在文件行上右键，可查看完整信息、打开文件、定位目录或复制路径。\n"
+            "7. 手工设置保留/删除，或使用智能选择后再复核。\n"
+            "8. 点击“执行已标记删除”，文件默认进入 Windows 回收站。\n\n"
             "识别示例：\n"
             "MIDA-630、MIDA-630-C、MIDA-630-4K 会归为同组；\n"
             "寒战、寒战1、经典剧情《寒战1》会作为候选同组。\n\n"
             "软件先识别作品编号、日期单集、季集编号或影视标题，再比较作品身份；不会仅因文件名前缀相同就合并。\n"
-            "同一系列的不同日期、不同季集，以及 KAVR-253-2 / KAVR-253-8 这类不同分段都会隔离。\n"
+            "同一系列的不同日期/编号、不同季集，以及 KAVR-253-2 / KAVR-253-8 这类不同分段都会隔离。\n"
+            "VTS_01_1.VOB 等通用光盘名会改用上级影片目录识别作品；VD-1080/HD-720 只作为画质标签。\n"
             "还支持网站前缀、繁简体、年份、罗马数字、发布组标签与 MD5 完全重复。\n"
             "MD5 可选关闭、智能、完整三档；智能模式先读三段快速指纹，只有相同时才完整读取。\n"
             "MD5 模式在开始扫描前确定，运行中不会再弹窗等待确认；已验证缓存可减少重复读取。\n\n"

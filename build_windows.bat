@@ -44,7 +44,7 @@ if errorlevel 1 goto :failed
 echo.
 echo Build completed successfully.
 echo EXE: %CD%\dist\MediaDupFinder.exe
-echo ZIP: %CD%\release\MediaDupFinder-v1.5.1-Windows-%MDF_ARCH%.zip
+echo ZIP: %CD%\release\MediaDupFinder-v1.7.0-Windows-%MDF_ARCH%.zip
 pause
 exit /b 0
 

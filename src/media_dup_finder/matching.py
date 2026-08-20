@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 from collections import defaultdict
@@ -13,6 +14,7 @@ from typing import Callable, DefaultDict, Iterable, List, Optional, Sequence, Se
 
 from .models import DuplicateGroup, FileRecord
 from .normalization import NormalizedName
+from .scan_filters import SCOPE_ALL, comparison_pair_allowed, validate_comparison_scope
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,7 @@ def _has_sufficient_title_identity(info: NormalizedName) -> bool:
     """Reject labels that are too ambiguous to represent a work on their own."""
 
     if info.identity_kind != "title":
-        return True
+        return bool(info.primary)
     if not info.primary:
         return False
     tokens = tuple(token for token in info.tokens if token)
@@ -107,6 +109,11 @@ def _has_sufficient_title_identity(info: NormalizedName) -> bool:
     # Without a series name they are not a reliable work identity. Four-digit
     # numeric titles such as 1917 and 1984 remain available.
     if tokens and all(token.isdigit() for token in tokens) and len(info.primary) <= 3:
+        return False
+    # Two- or three-letter leftovers (for example "ck") are commonly release
+    # fragments extracted from unrelated long names. Exact MD5 can still find
+    # byte-identical files, but title matching must not build a large group.
+    if re.fullmatch(r"[a-z]{1,3}", info.primary):
         return False
     return True
 
@@ -288,9 +295,11 @@ def _bucket_pair_count(count: int) -> int:
 
 def _candidate_pairs(
     files: Sequence[FileRecord],
+    comparison_scope: str = SCOPE_ALL,
     progress: Optional[MatchingProgress] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Set[Tuple[int, int]]:
+    validate_comparison_scope(comparison_scope)
     pairs: Set[Tuple[int, int]] = set()
     exact: DefaultDict[str, List[int]] = defaultdict(list)
     blocks: DefaultDict[str, List[int]] = defaultdict(list)
@@ -346,7 +355,8 @@ def _candidate_pairs(
         for left, right in _all_pairs(bucket):
             if _cancelled(cancel_event):
                 return pairs
-            pairs.add((left, right) if left < right else (right, left))
+            if comparison_pair_allowed(files[left], files[right], comparison_scope):
+                pairs.add((left, right) if left < right else (right, left))
             generation_meter.advance(
                 "{} ↔ {}".format(files[left].path.name, files[right].path.name)
             )
@@ -357,7 +367,8 @@ def _candidate_pairs(
         for _, right in ordered[position + 1:position + 21]:
             if _cancelled(cancel_event):
                 return pairs
-            pairs.add((left, right) if left < right else (right, left))
+            if comparison_pair_allowed(files[left], files[right], comparison_scope):
+                pairs.add((left, right) if left < right else (right, left))
             generation_meter.advance(
                 "{} ↔ {}".format(files[left].path.name, files[right].path.name)
             )
@@ -373,6 +384,7 @@ def _split_component(
     indices: List[int],
     files: Sequence[FileRecord],
     threshold: float,
+    comparison_scope: str,
     progress_meter: Optional[_ProgressMeter] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> List[Tuple[List[int], float, str]]:
@@ -393,6 +405,10 @@ def _split_component(
         for index in sorted(remaining - {anchor}):
             if _cancelled(cancel_event):
                 return []
+            if not comparison_pair_allowed(
+                files[anchor], files[index], comparison_scope,
+            ):
+                continue
             score, reason = compare_records(files[anchor], files[index])
             if score >= threshold:
                 cluster.append(index)
@@ -412,6 +428,7 @@ def _split_component(
 def group_similar_files(
     files: Sequence[FileRecord],
     threshold: float = 0.90,
+    comparison_scope: str = SCOPE_ALL,
     cancel_event: Optional[threading.Event] = None,
     progress: Optional[MatchingProgress] = None,
 ) -> List[DuplicateGroup]:
@@ -419,11 +436,17 @@ def group_similar_files(
 
     if not 0.60 <= threshold <= 1.0:
         raise ValueError("threshold must be between 0.60 and 1.0")
+    validate_comparison_scope(comparison_scope)
     if len(files) < 2 or _cancelled(cancel_event):
         return []
 
     union_find = _UnionFind(len(files))
-    candidate_pairs = _candidate_pairs(files, progress=progress, cancel_event=cancel_event)
+    candidate_pairs = _candidate_pairs(
+        files,
+        comparison_scope=comparison_scope,
+        progress=progress,
+        cancel_event=cancel_event,
+    )
     if _cancelled(cancel_event):
         return []
     comparison_meter = _ProgressMeter(
@@ -462,6 +485,7 @@ def group_similar_files(
             indices,
             files,
             threshold,
+            comparison_scope,
             progress_meter=group_meter,
             cancel_event=cancel_event,
         )

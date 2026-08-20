@@ -15,6 +15,7 @@ from media_dup_finder.hashing import (
 from media_dup_finder.matching import group_similar_files
 from media_dup_finder.models import FileRecord
 from media_dup_finder.normalization import normalize_stem
+from media_dup_finder.scan_filters import SCOPE_DIFFERENT_FOLDER, SCOPE_SAME_FOLDER
 
 
 def record(path: Path) -> FileRecord:
@@ -89,6 +90,38 @@ class HashingTests(unittest.TestCase):
             self.assertEqual(groups[0].match_kind, "mixed")
             self.assertEqual(len(groups[0].files), 3)
             self.assertEqual(len({item.file_id for item in groups[0].files}), 3)
+
+    def test_name_group_cannot_bridge_different_exact_md5_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = []
+            for folder_name, payload in (
+                ("a1", b"AAAA"), ("a2", b"AAAA"),
+                ("b1", b"BBBB"), ("b2", b"BBBB"),
+            ):
+                folder = root / folder_name
+                folder.mkdir()
+                path = folder / "060 ryuenami.mp4"
+                path.write_bytes(payload)
+                paths.append(path)
+            records = [record(path) for path in paths]
+            name_groups = group_similar_files(records)
+            hash_groups, warnings, cancelled, _ = find_exact_duplicate_groups(
+                records, use_cache=False,
+            )
+            self.assertEqual(warnings, [])
+            self.assertFalse(cancelled)
+            self.assertEqual(len(name_groups), 1)
+            self.assertEqual(len(hash_groups), 2)
+
+            groups = merge_duplicate_groups(name_groups, hash_groups)
+
+            self.assertEqual(len(groups), 2)
+            self.assertTrue(all(group.match_kind == "hash" for group in groups))
+            self.assertEqual(sorted(len(group.files) for group in groups), [2, 2])
+            self.assertEqual(
+                len({item.file_id for group in groups for item in group.files}), 4,
+            )
 
     def test_smart_mode_skips_full_read_when_large_samples_differ(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -193,6 +226,45 @@ class HashingTests(unittest.TestCase):
             self.assertEqual(workload.size_groups, 1)
             self.assertEqual(workload.candidate_files, 2)
             self.assertEqual(workload.maximum_full_bytes, 20)
+
+    def test_different_folder_scope_ignores_same_folder_exact_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.mp4"
+            second = root / "second.mkv"
+            first.write_bytes(b"same")
+            second.write_bytes(b"same")
+            groups, _, _, stats = find_exact_duplicate_groups(
+                [record(first), record(second)],
+                comparison_scope=SCOPE_DIFFERENT_FOLDER,
+                use_cache=False,
+            )
+            self.assertEqual(groups, [])
+            self.assertEqual(stats.candidate_files, 0)
+
+    def test_same_folder_scope_keeps_hash_groups_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            folder_a = root / "a"
+            folder_b = root / "b"
+            folder_a.mkdir()
+            folder_b.mkdir()
+            paths = [
+                folder_a / "one.mp4",
+                folder_a / "two.mkv",
+                folder_b / "three.mov",
+            ]
+            for path in paths:
+                path.write_bytes(b"same")
+            groups, _, _, stats = find_exact_duplicate_groups(
+                [record(path) for path in paths],
+                comparison_scope=SCOPE_SAME_FOLDER,
+                use_cache=False,
+            )
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups[0].files), 2)
+            self.assertEqual({item.path.parent.name for item in groups[0].files}, {"a"})
+            self.assertEqual(stats.candidate_files, 2)
 
 
 if __name__ == "__main__":

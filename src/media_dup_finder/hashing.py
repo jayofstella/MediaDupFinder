@@ -14,6 +14,12 @@ from typing import Callable, DefaultDict, Dict, List, Optional, Sequence, Set, T
 from .hash_cache import HashCache
 from .matching import make_group_id
 from .models import DuplicateGroup, FileRecord
+from .scan_filters import (
+    SCOPE_ALL,
+    comparison_group_allowed,
+    scope_partition_key,
+    validate_comparison_scope,
+)
 
 
 HASH_MODE_OFF = "off"
@@ -103,14 +109,17 @@ class _ProgressMeter:
 
 def _candidate_size_groups(
     files: Sequence[FileRecord],
+    comparison_scope: str = SCOPE_ALL,
 ) -> List[Tuple[int, List[FileRecord]]]:
-    by_size: DefaultDict[int, List[FileRecord]] = defaultdict(list)
+    validate_comparison_scope(comparison_scope)
+    by_size: DefaultDict[Tuple[int, str], List[FileRecord]] = defaultdict(list)
     for record in files:
-        by_size[record.size].append(record)
+        partition = scope_partition_key(record, comparison_scope)
+        by_size[(record.size, partition)].append(record)
     return [
-        (size, sorted(records, key=lambda item: str(item.path).casefold()))
-        for size, records in sorted(by_size.items())
-        if len(records) >= 2
+        (key[0], sorted(records, key=lambda item: str(item.path).casefold()))
+        for key, records in sorted(by_size.items())
+        if comparison_group_allowed(records, comparison_scope)
     ]
 
 
@@ -126,14 +135,19 @@ def _sample_bytes(size: int) -> int:
     return sum(length for _, length in _sample_spans(size))
 
 
-def estimate_hash_workload(files: Sequence[FileRecord], mode: str) -> HashWorkload:
+def estimate_hash_workload(
+    files: Sequence[FileRecord],
+    mode: str,
+    comparison_scope: str = SCOPE_ALL,
+) -> HashWorkload:
     """Estimate the bytes touched before any file content is opened."""
 
     if mode not in VALID_HASH_MODES:
         raise ValueError("unsupported hash mode: {}".format(mode))
+    validate_comparison_scope(comparison_scope)
     if mode == HASH_MODE_OFF:
         return HashWorkload(mode, 0, 0, 0, 0)
-    groups = _candidate_size_groups(files)
+    groups = _candidate_size_groups(files, comparison_scope)
     candidates = [record for _, records in groups for record in records]
     return HashWorkload(
         mode=mode,
@@ -233,11 +247,12 @@ def hash_file(path: Path, cancel_event: Optional[threading.Event] = None) -> Opt
 
 
 def _make_hash_groups(
-    by_hash: DefaultDict[Tuple[int, str], List[FileRecord]],
+    by_hash: DefaultDict[Tuple[int, str, str], List[FileRecord]],
+    comparison_scope: str,
 ) -> List[DuplicateGroup]:
     groups: List[DuplicateGroup] = []
     for records in by_hash.values():
-        if len(records) < 2:
+        if not comparison_group_allowed(records, comparison_scope):
             continue
         records.sort(key=lambda item: item.quality_rank, reverse=True)
         groups.append(DuplicateGroup(
@@ -254,6 +269,7 @@ def _make_hash_groups(
 def find_exact_duplicate_groups(
     files: Sequence[FileRecord],
     mode: str = HASH_MODE_SMART,
+    comparison_scope: str = SCOPE_ALL,
     cancel_event: Optional[threading.Event] = None,
     progress: Optional[HashProgress] = None,
     cache_path: Optional[Path] = None,
@@ -263,7 +279,8 @@ def find_exact_duplicate_groups(
 
     if mode not in VALID_HASH_MODES:
         raise ValueError("unsupported hash mode: {}".format(mode))
-    workload = estimate_hash_workload(files, mode)
+    validate_comparison_scope(comparison_scope)
+    workload = estimate_hash_workload(files, mode, comparison_scope)
     stats = HashScanStats(mode=mode, candidate_files=workload.candidate_files)
     if mode == HASH_MODE_OFF:
         return [], [], False, stats
@@ -274,7 +291,7 @@ def find_exact_duplicate_groups(
     cache = HashCache(cache_path, enabled=use_cache)
     candidates = [
         record
-        for _, records in _candidate_size_groups(files)
+        for _, records in _candidate_size_groups(files, comparison_scope)
         for record in records
     ]
     quick_meter = _ProgressMeter("快速指纹", workload.quick_bytes, progress)
@@ -318,13 +335,17 @@ def find_exact_duplicate_groups(
         if mode == HASH_MODE_DEEP:
             target_ids: Set[str] = {record.file_id for record in valid_records}
         else:
-            by_quick: DefaultDict[Tuple[int, str], List[FileRecord]] = defaultdict(list)
+            by_quick: DefaultDict[Tuple[int, str, str], List[FileRecord]] = defaultdict(list)
             for record in valid_records:
-                by_quick[(record.size, quick_by_file[record.file_id])].append(record)
+                by_quick[(
+                    record.size,
+                    quick_by_file[record.file_id],
+                    scope_partition_key(record, comparison_scope),
+                )].append(record)
             target_ids = {
                 record.file_id
                 for records in by_quick.values()
-                if len(records) >= 2
+                if comparison_group_allowed(records, comparison_scope)
                 for record in records
             }
             for record in valid_records:
@@ -359,11 +380,15 @@ def find_exact_duplicate_groups(
             full_meter.advance(0, to_hash[-1].path.name, force=True)
         stats.full_bytes_read = full_meter.processed
 
-        by_hash: DefaultDict[Tuple[int, str], List[FileRecord]] = defaultdict(list)
+        by_hash: DefaultDict[Tuple[int, str, str], List[FileRecord]] = defaultdict(list)
         for record in targets:
             if record.content_md5:
-                by_hash[(record.size, record.content_md5)].append(record)
-        groups = _make_hash_groups(by_hash)
+                by_hash[(
+                    record.size,
+                    record.content_md5,
+                    scope_partition_key(record, comparison_scope),
+                )].append(record)
+        groups = _make_hash_groups(by_hash, comparison_scope)
         cache.save()
         warnings.extend(cache.warnings)
         return groups, warnings, False, stats
@@ -394,52 +419,110 @@ def merge_duplicate_groups(
     name_groups: Sequence[DuplicateGroup],
     hash_groups: Sequence[DuplicateGroup],
 ) -> List[DuplicateGroup]:
-    """Merge overlapping results so a file never appears in two UI groups."""
+    """Combine name and MD5 results without transitive hash-group bridges.
 
-    all_groups = list(name_groups) + list(hash_groups)
-    if not all_groups:
-        return []
-    union_find = _GroupUnionFind(len(all_groups))
-    first_owner: Dict[str, int] = {}
-    for index, group in enumerate(all_groups):
-        for record in group.files:
-            owner = first_owner.get(record.file_id)
-            if owner is None:
-                first_owner[record.file_id] = index
-            else:
-                union_find.union(index, owner)
+    Exact-content groups are authoritative islands. A single name group may
+    extend one such island with alternate encodes, but it may never join two
+    different MD5 islands. This prevents one weak filename identity from
+    chaining dozens of otherwise unrelated exact-duplicate pairs into a giant
+    group, while still ensuring every file appears at most once in the UI.
+    """
 
-    components: DefaultDict[int, List[DuplicateGroup]] = defaultdict(list)
-    for index, group in enumerate(all_groups):
-        components[union_find.find(index)].append(group)
-
-    merged = []
-    for component in components.values():
-        if len(component) == 1:
-            merged.append(component[0])
+    hash_bins: List[Dict[str, object]] = []
+    file_to_hash: Dict[str, int] = {}
+    assigned_ids: Set[str] = set()
+    for original in hash_groups:
+        records = []
+        for record in original.files:
+            if record.file_id in assigned_ids:
+                continue
+            assigned_ids.add(record.file_id)
+            records.append(record)
+        if len(records) < 2:
             continue
-        record_map: Dict[str, FileRecord] = {}
-        for group in component:
-            for record in group.files:
+        index = len(hash_bins)
+        record_map = {record.file_id: record for record in records}
+        hash_bins.append({
+            "records": record_map,
+            "name_confidences": [],
+            "metadata_notes": [original.metadata_note] if original.metadata_note else [],
+            "safety_warning": original.safety_warning,
+        })
+        for record in records:
+            file_to_hash[record.file_id] = index
+
+    standalone: List[DuplicateGroup] = []
+    for name_group in name_groups:
+        overlaps = {
+            file_to_hash[record.file_id]
+            for record in name_group.files
+            if record.file_id in file_to_hash
+        }
+        extras = [
+            record for record in name_group.files
+            if record.file_id not in file_to_hash and record.file_id not in assigned_ids
+        ]
+        if len(overlaps) == 1:
+            target_index = next(iter(overlaps))
+            target = hash_bins[target_index]
+            record_map = target["records"]
+            assert isinstance(record_map, dict)
+            for record in extras:
                 record_map[record.file_id] = record
+                assigned_ids.add(record.file_id)
+            if extras:
+                confidences = target["name_confidences"]
+                assert isinstance(confidences, list)
+                confidences.append(name_group.confidence)
+                notes = target["metadata_notes"]
+                assert isinstance(notes, list)
+                if name_group.metadata_note:
+                    notes.append(name_group.metadata_note)
+                target["safety_warning"] = bool(
+                    target["safety_warning"] or name_group.safety_warning
+                )
+            continue
+
+        # No hash overlap: preserve the ordinary work-identity group. More
+        # than one overlap is deliberately split; only its un-hashed remainder
+        # may remain as a separate name group.
+        if len(extras) >= 2:
+            for record in extras:
+                assigned_ids.add(record.file_id)
+            records = sorted(extras, key=lambda item: item.quality_rank, reverse=True)
+            standalone.append(DuplicateGroup(
+                group_id=make_group_id(records),
+                files=records,
+                confidence=name_group.confidence,
+                reason=name_group.reason,
+                match_kind="name",
+                metadata_note=name_group.metadata_note,
+                safety_warning=name_group.safety_warning,
+            ))
+
+    merged: List[DuplicateGroup] = []
+    for target in hash_bins:
+        record_map = target["records"]
+        confidences = target["name_confidences"]
+        notes = target["metadata_notes"]
+        assert isinstance(record_map, dict)
+        assert isinstance(confidences, list)
+        assert isinstance(notes, list)
         records = sorted(record_map.values(), key=lambda item: item.quality_rank, reverse=True)
-        kinds = {group.match_kind for group in component}
-        name_confidences = [group.confidence for group in component if group.match_kind == "name"]
-        if "hash" in kinds and "name" in kinds:
-            kind = "mixed"
-            reason = "组内既有 MD5 完全相同文件，也有作品身份相同的不同版本"
-        elif "hash" in kinds:
-            kind = "hash"
-            reason = "文件大小与完整 MD5 均相同"
-        else:
-            kind = "name"
-            reason = component[0].reason
+        mixed = bool(confidences)
         merged.append(DuplicateGroup(
             group_id=make_group_id(records),
             files=records,
-            confidence=min(name_confidences) if name_confidences else 1.0,
-            reason=reason,
-            match_kind=kind,
+            confidence=min(confidences) if confidences else 1.0,
+            reason=(
+                "组内既有 MD5 完全相同文件，也有作品身份相同的不同版本"
+                if mixed else "文件大小与完整 MD5 均相同"
+            ),
+            match_kind="mixed" if mixed else "hash",
+            metadata_note="；".join(dict.fromkeys(notes)),
+            safety_warning=bool(target["safety_warning"]),
         ))
+
+    merged.extend(standalone)
     merged.sort(key=lambda group: (group.estimated_savings, len(group.files)), reverse=True)
     return merged

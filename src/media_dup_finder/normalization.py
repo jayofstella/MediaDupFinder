@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -27,6 +27,7 @@ _CATALOG_COMPACT_RE = re.compile(
 _NON_CATALOG_PREFIXES = frozenset({
     "cd", "disc", "disk", "part", "pt", "season", "episode", "vol", "volume",
     "web", "hdr", "avc", "hevc", "xvid", "divx", "mp",
+    "hd", "sd", "fhd", "uhd", "vd", "video", "movie", "film",
     "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
 })
 
@@ -42,7 +43,7 @@ _CHINESE_PART_RE = re.compile(
 
 _DOMAIN_RE = re.compile(
     r"(?i)(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.)+"
-    r"(?:com|net|org|tv|cc|cn|me|io|xyz|site|info|club|top|co|uk|jp)"
+    r"(?:com|net|org|tv|cc|cn|me|io|xyz|site|info|club|top|co|uk|jp|la)"
     r"(?::\d+)?(?:/[^\s\[\]【】()]*)?"
 )
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
@@ -66,6 +67,12 @@ _EPISODE_ONLY_RE = re.compile(
 )
 _CHINESE_EPISODE_RE = re.compile(
     r"(?:^|[\s._-])第\s*0*(\d{1,4})\s*集(?=$|[\s._-])"
+)
+_PAREN_EPISODE_RE = re.compile(
+    r"(?i)(?:^|[\s._-])\(\s*0*(\d{1,5})\s*\)(?=$|[\s._-])"
+)
+_LONG_SERIES_NUMBER_RE = re.compile(
+    r"(?i)(?<![a-z0-9])([a-z]{8,})[\s._-]*0*(\d{2,6})(?![a-z0-9])"
 )
 _SITE_BRAND_RE = re.compile(
     r"(?i)(?:^|[\s._-])(?:big|fun)?\d{3,5}(?:社区|论坛|論壇)(?=$|[\s._-])"
@@ -99,15 +106,17 @@ _NOISE_PHRASE_RE = re.compile(
 )
 
 _NOISE_TOKENS = frozenset({
-    "4k", "8k", "uhd", "fhd", "hd", "sd", "hdr", "hdr10", "dolbyvision",
+    "4k", "8k", "uhd", "fhd", "hd", "sd", "vd", "hdr", "hdr10", "dolbyvision",
     "2160p", "1440p", "1080p", "1080i", "720p", "576p", "480p", "360p",
     "bluray", "bdrip", "brrip", "dvdrip", "hdtv", "webrip", "webdl", "remux",
     "cam", "ts", "tc", "xvid", "divx", "x264", "x265", "h264", "h265",
     "hevc", "av1", "aac", "ac3", "dts", "flac", "atmos", "10bit", "8bit",
     "proper", "repack", "internal", "limited", "extended", "uncut", "directorscut",
+    "mp4", "mkv", "mov", "avi", "wmv", "flv", "rm", "rmvb", "m4v",
+    "webm", "mpg", "mpeg", "m2ts", "vob", "3gp",
     "中字", "中英", "字幕", "双语", "国语", "国配", "粤语", "英语", "日语", "韩语",
     "简体", "繁体", "简中", "繁中", "chs", "cht", "eng", "sub", "subs",
-    "subbed", "dub", "dubbed", "c", "uc", "uncensored", "censored", "leak", "sample",
+    "subbed", "dub", "dubbed", "c", "uc", "uncensored", "censored", "sample",
 })
 _RELEASE_GROUP_TOKENS = frozenset({
     "rarbg", "yts", "yify", "ettv", "eztv", "ion10", "ctrlhd", "mteam", "cmct",
@@ -116,6 +125,8 @@ _RELEASE_GROUP_TOKENS = frozenset({
 })
 _NOISE_PATTERNS = (
     re.compile(r"(?i)^[0-9]{3,4}[pi]$"),
+    re.compile(r"(?i)^(?:2160|1440|1080|720|576|480|360)$"),
+    re.compile(r"(?i)^(?:vd|hd|fhd|uhd)(?:2160|1440|1080|720|576|480|360)[pi]?$"),
     re.compile(r"(?i)^(?:x|h)[._-]?(?:264|265)$"),
     re.compile(r"(?i)^[0-9]+(?:bit|fps)$"),
 )
@@ -136,6 +147,30 @@ class NormalizedName:
     series_key: Optional[str] = None
     episode_date: Optional[str] = None
     episode_id: Optional[str] = None
+    identity_source: str = "文件名"
+    source_text: str = ""
+
+
+_GENERIC_MEDIA_FOLDER_NAMES = frozenset({
+    "video_ts", "audio_ts", "bdmv", "stream", "clipinf", "playlist",
+    "certificate", "avchd", "private",
+})
+_GENERIC_LIBRARY_FOLDER_NAMES = frozenset({
+    "movie", "movies", "video", "videos", "media", "download", "downloads",
+    "complete", "completed", "new folder", "新建文件夹", "电影", "影片",
+    "影视", "视频", "下载", "成人", "av", "jav",
+})
+_GENERIC_SEGMENT_FOLDER_RE = re.compile(
+    r"(?i)^(?:cd|disc|disk|dvd|part|pt)[\s._-]*0*([1-9][0-9]?)$"
+)
+_GENERIC_DVD_STEM_RE = re.compile(
+    r"(?i)^vts[\s._-]*0*(\d{1,2})[\s._-]+0*(\d{1,2})$"
+)
+_GENERIC_DISC_STEM_RE = re.compile(
+    r"(?i)^(?:video[\s._-]*ts|audio[\s._-]*ts|avseq|mpegav|title|track)"
+    r"[\s._-]*0*(\d{0,4})$"
+)
+_GENERIC_NUMERIC_STEM_RE = re.compile(r"^0*(\d{1,6})$")
 
 
 def _normalize_serial(digits: str) -> str:
@@ -158,7 +193,9 @@ def _valid_catalog(
     if len(digits) < 3 and not compact and "-" not in separator:
         return False
     if digits in {"2160", "1440", "1080", "720", "576", "480", "360"}:
-        if following in {"p", "i"} or folded in {"video", "movie", "film", "uhd"}:
+        if following in {"p", "i"} or folded in {
+            "video", "movie", "film", "uhd", "fhd", "hd", "sd", "vd",
+        }:
             return False
     # A movie-year-range value is usually a release year when separated by
     # spaces/dots/underscores, or compacted after a title such as IT2017.
@@ -223,6 +260,12 @@ def _part_marker(
             return "part{}".format(int(meaningful[0]))
         if len(meaningful) == 1 and meaningful[0].casefold() in {"a", "b"}:
             return "segment:{}".format(meaningful[0].casefold().upper())
+        # Catalog releases sometimes put a long descriptive title before the
+        # final _1/_2 segment. Preserve that explicit trailing segment even
+        # though the middle title contains many meaningful words.
+        trailing = re.search(r"(?:_|-)0*([1-9]|1[0-9]|20)\s*$", tail)
+        if trailing:
+            return "part{}".format(int(trailing.group(1)))
     return None
 
 
@@ -389,7 +432,7 @@ def _episode_identity(text: str) -> Optional[_EpisodeIdentity]:
             display="{} · {}".format(" ".join(series_tokens), episode_id.upper()),
         )
 
-    for pattern in (_EPISODE_ONLY_RE, _CHINESE_EPISODE_RE):
+    for pattern in (_EPISODE_ONLY_RE, _CHINESE_EPISODE_RE, _PAREN_EPISODE_RE):
         match = pattern.search(text)
         if not match:
             continue
@@ -407,6 +450,27 @@ def _episode_identity(text: str) -> Optional[_EpisodeIdentity]:
             title_tokens=title_tokens,
             primary="episode{}{}".format(series_key, episode_id),
             display="{} · {}".format(" ".join(series_tokens), episode_id.upper()),
+        )
+
+    # Long compact series names followed by a running number are common in
+    # downloaded libraries (for example fellatiojapan567). The number is the
+    # concrete episode/work identity, not a disposable filename suffix.
+    compact = _LONG_SERIES_NUMBER_RE.search(text)
+    if compact and not (
+        len(compact.group(2)) == 4
+        and 1900 <= int(compact.group(2)) <= 2099
+    ):
+        series_key = compact.group(1).casefold()
+        episode_id = "e{:06d}".format(int(compact.group(2)))
+        title_tokens = _meaningful_tokens(text[compact.end():])
+        return _EpisodeIdentity(
+            kind="series_episode",
+            series_key=series_key,
+            episode_date=None,
+            episode_id=episode_id,
+            title_tokens=title_tokens,
+            primary="episode{}{}".format(series_key, episode_id),
+            display="{} · {}".format(series_key, episode_id.upper()),
         )
     return None
 
@@ -539,8 +603,120 @@ def normalize_stem(stem: str) -> NormalizedName:
         series_key=series_key,
         episode_date=episode_date,
         episode_id=episode_id,
+        identity_source="文件名",
+        source_text=raw,
     )
 
 
 def normalize_filename(filename: str) -> NormalizedName:
     return normalize_stem(Path(filename).stem)
+
+
+def _generic_media_segment(path: Path) -> Optional[str]:
+    """Return a stable segment marker for a generic disc-container name."""
+
+    stem = unicodedata.normalize("NFKC", path.stem).strip().casefold()
+    parent_segment = ""
+    for parent_name in reversed(path.parent.parts[-4:]):
+        parent_match = _GENERIC_SEGMENT_FOLDER_RE.fullmatch(parent_name.strip())
+        if parent_match:
+            parent_segment = "disc{}-".format(int(parent_match.group(1)))
+            break
+    dvd = _GENERIC_DVD_STEM_RE.fullmatch(stem)
+    if dvd:
+        return "disc:{}vts{:02d}-{:02d}".format(
+            parent_segment, int(dvd.group(1)), int(dvd.group(2)),
+        )
+    generic = _GENERIC_DISC_STEM_RE.fullmatch(stem)
+    if generic:
+        number = generic.group(1)
+        prefix = stem[:-len(number)] if number else stem
+        prefix = re.sub(r"[\s._-]+", "", prefix)
+        return "disc:{}{}".format(
+            parent_segment,
+            prefix if not number else "{}-{}".format(prefix, int(number)),
+        )
+    parent_names = {
+        unicodedata.normalize("NFKC", item).strip().casefold()
+        for item in path.parent.parts[-3:]
+    }
+    numeric = _GENERIC_NUMERIC_STEM_RE.fullmatch(stem)
+    if numeric and parent_names & _GENERIC_MEDIA_FOLDER_NAMES:
+        return "disc:{}stream-{:06d}".format(parent_segment, int(numeric.group(1)))
+    return None
+
+
+def _meaningful_parent(path: Path, root: Optional[Path]) -> Optional[Path]:
+    """Find the nearest parent likely to contain a disc image's work title."""
+
+    root_identity = None
+    if root is not None:
+        try:
+            root_identity = root.resolve()
+        except OSError:
+            root_identity = root.absolute()
+    current = path.parent
+    for _ in range(6):
+        if not current.name:
+            return None
+        folded = unicodedata.normalize("NFKC", current.name).strip().casefold()
+        if (
+            folded not in _GENERIC_MEDIA_FOLDER_NAMES
+            and folded not in _GENERIC_LIBRARY_FOLDER_NAMES
+            and not _GENERIC_SEGMENT_FOLDER_RE.fullmatch(folded)
+        ):
+            info = normalize_stem(current.name)
+            if info.primary and not (
+                info.identity_kind == "title"
+                and re.fullmatch(r"[a-z]{1,3}|\d{1,3}", info.primary)
+            ):
+                return current
+        if root_identity is not None:
+            try:
+                reached_root = current.resolve() == root_identity
+            except OSError:
+                reached_root = current.absolute() == root_identity
+            if reached_root:
+                return None
+        if current.parent == current:
+            return None
+        current = current.parent
+    return None
+
+
+def normalize_path(path: Path, root: Optional[Path] = None) -> NormalizedName:
+    """Normalize one path and use folder context only for generic disc names.
+
+    DVD/BDMV files such as VTS_01_1.VOB or 00001.M2TS carry a segment label,
+    not a work title. In that narrow case the nearest meaningful parent folder
+    supplies the work identity and the filename supplies the segment marker.
+    """
+
+    source_path = Path(path)
+    segment = _generic_media_segment(source_path)
+    if not segment:
+        return normalize_stem(source_path.stem)
+    parent = _meaningful_parent(source_path, root)
+    if parent is None:
+        raw = source_path.stem
+        return NormalizedName(
+            raw=raw,
+            cleaned_display="未识别光盘作品（{}）".format(raw),
+            catalog_key=None,
+            primary="",
+            aliases=(),
+            part_marker=segment,
+            tokens=(),
+            identity_kind="generic_media",
+            work_key="",
+            identity_source="上级目录不足",
+            source_text=str(source_path.parent),
+        )
+    parent_info = normalize_stem(parent.name)
+    return replace(
+        parent_info,
+        raw=source_path.stem,
+        part_marker=segment,
+        identity_source="上级影片目录",
+        source_text=parent.name,
+    )

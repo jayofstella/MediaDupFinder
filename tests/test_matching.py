@@ -11,7 +11,8 @@ from media_dup_finder.matching import (
     group_similar_files,
 )
 from media_dup_finder.models import FileRecord
-from media_dup_finder.normalization import normalize_stem
+from media_dup_finder.normalization import normalize_path, normalize_stem
+from media_dup_finder.scan_filters import SCOPE_DIFFERENT_FOLDER, SCOPE_SAME_FOLDER
 
 
 def record(folder: Path, name: str, size: int = 1000) -> FileRecord:
@@ -226,6 +227,101 @@ class MatchingTests(unittest.TestCase):
         cancel_event.set()
         files = [record(self.folder, "寒战.mkv"), record(self.folder, "寒战1.mp4")]
         self.assertEqual(group_similar_files(files, cancel_event=cancel_event), [])
+
+    def test_different_folder_scope_excludes_same_folder_pairs(self) -> None:
+        same_folder_files = [
+            record(self.folder, "MIDA-630.mp4"),
+            record(self.folder, "MIDA-630-4k.mkv"),
+        ]
+        self.assertEqual(
+            group_similar_files(
+                same_folder_files, comparison_scope=SCOPE_DIFFERENT_FOLDER,
+            ),
+            [],
+        )
+        cross_folder_files = [
+            record(self.folder / "first", "MIDA-630.mp4"),
+            record(self.folder / "second", "MIDA-630-4k.mkv"),
+        ]
+        self.assertEqual(
+            len(group_similar_files(
+                cross_folder_files, comparison_scope=SCOPE_DIFFERENT_FOLDER,
+            )),
+            1,
+        )
+
+    def test_same_folder_scope_does_not_bridge_other_directories(self) -> None:
+        files = [
+            record(self.folder / "first", "MIDA-630.mp4"),
+            record(self.folder / "first", "MIDA-630-4k.mkv"),
+            record(self.folder / "second", "MIDA-630.mov"),
+        ]
+        groups = group_similar_files(files, comparison_scope=SCOPE_SAME_FOLDER)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].files), 2)
+        self.assertEqual({item.path.parent.name for item in groups[0].files}, {"first"})
+
+    def test_quality_labels_alone_do_not_create_work_groups(self) -> None:
+        files = [
+            record(self.folder, "VD-1080.mp4"),
+            record(self.folder, "VD-1080-copy.mkv"),
+            record(self.folder, "HD-720.mov"),
+        ]
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_compact_series_running_numbers_do_not_match_each_other(self) -> None:
+        files = [
+            record(self.folder, "www.98T.la@fellatiojapan567.mp4"),
+            record(self.folder, "www.98T.la@fellatiojapan568.mp4"),
+        ]
+        score, reason = compare_records(files[0], files[1])
+        self.assertEqual(score, 0.0)
+        self.assertIn("编号", reason)
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_parenthesized_series_numbers_do_not_match_each_other(self) -> None:
+        files = [
+            record(self.folder, "Japanese amateur leak (1)_hd720.mp4"),
+            record(self.folder, "Japanese amateur leak (10)_hd720.mp4"),
+        ]
+        self.assertEqual(group_similar_files(files), [])
+
+    def test_long_catalog_filename_segments_are_not_interchangeable(self) -> None:
+        files = [
+            record(self.folder, "RVR-15 very long descriptive work title_1.mp4"),
+            record(self.folder, "RVR-15 very long descriptive work title_2.mp4"),
+        ]
+        score, reason = compare_records(files[0], files[1])
+        self.assertEqual(score, 0.0)
+        self.assertIn("分段", reason)
+
+    def test_generic_dvd_segments_use_parent_work_and_stay_separate(self) -> None:
+        root = self.folder / "library"
+
+        def dvd(work: str, segment: str, copy: str) -> FileRecord:
+            path = root / copy / work / "VIDEO_TS" / segment
+            return FileRecord(
+                path=path,
+                root=root,
+                size=1000,
+                modified_time=1.0,
+                name_info=normalize_path(path, root),
+            )
+
+        same_segment = [
+            dvd("STARS-140", "VTS_01_1.VOB", "copy-a"),
+            dvd("STARS-140", "VTS_01_1.VOB", "copy-b"),
+        ]
+        self.assertEqual(len(group_similar_files(same_segment)), 1)
+        different_segments = [
+            dvd("STARS-140", "VTS_01_1.VOB", "copy-a"),
+            dvd("STARS-140", "VTS_01_2.VOB", "copy-b"),
+        ]
+        self.assertEqual(group_similar_files(different_segments), [])
+
+    def test_short_ascii_fragment_is_not_a_safe_title(self) -> None:
+        files = [record(self.folder, "ck.mp4"), record(self.folder, "ck.mkv")]
+        self.assertEqual(group_similar_files(files), [])
 
 
 

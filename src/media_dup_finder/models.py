@@ -131,6 +131,31 @@ class DuplicateGroup:
 
 
 @dataclass
+class ScanStatistics:
+    regular_files_seen: int = 0
+    included_files: int = 0
+    skipped_extension: int = 0
+    skipped_too_small: int = 0
+    skipped_too_large: int = 0
+    skipped_hidden_system_files: int = 0
+    skipped_hidden_system_directories: int = 0
+    skipped_excluded_directories: int = 0
+    skipped_incomplete: int = 0
+    skipped_keyword: int = 0
+
+    @property
+    def filtered_files(self) -> int:
+        return (
+            self.skipped_extension
+            + self.skipped_too_small
+            + self.skipped_too_large
+            + self.skipped_hidden_system_files
+            + self.skipped_incomplete
+            + self.skipped_keyword
+        )
+
+
+@dataclass
 class ScanResult:
     files: List[FileRecord]
     groups: List[DuplicateGroup]
@@ -140,3 +165,6 @@ class ScanResult:
     hash_candidate_files: int = 0
     hash_bytes_read: int = 0
     hash_cache_hits: int = 0
+    scan_statistics: ScanStatistics = field(default_factory=ScanStatistics)
+    comparison_scope: str = "all"
+    name_matching_enabled: bool = True

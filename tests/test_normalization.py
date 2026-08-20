@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
-from media_dup_finder.normalization import normalize_filename
+from media_dup_finder.normalization import normalize_filename, normalize_path
 
 
 class NormalizationTests(unittest.TestCase):
@@ -144,6 +145,52 @@ class NormalizationTests(unittest.TestCase):
         info = normalize_filename("1917.1080p.mkv")
         self.assertEqual(info.years, ())
         self.assertEqual(info.primary, "1917")
+
+    def test_quality_prefixes_are_not_catalog_or_work_identities(self) -> None:
+        for name in ("VD-1080.mp4", "HD-720.mkv", "FHD-1080.mov"):
+            with self.subTest(name=name):
+                info = normalize_filename(name)
+                self.assertIsNone(info.catalog_key)
+                self.assertEqual(info.primary, "")
+
+    def test_long_compact_series_number_is_concrete_episode_identity(self) -> None:
+        info = normalize_filename("www.98T.la@fellatiojapan567_hd.mp4")
+        self.assertEqual(info.identity_kind, "series_episode")
+        self.assertEqual(info.series_key, "fellatiojapan")
+        self.assertEqual(info.episode_id, "e000567")
+        self.assertNotIn("98t", info.primary)
+
+    def test_compact_movie_sequel_or_year_is_not_forced_into_series_episode(self) -> None:
+        self.assertEqual(normalize_filename("Terminator2.mp4").identity_kind, "title")
+        self.assertEqual(normalize_filename("BladeRunner2049.mkv").identity_kind, "title")
+
+    def test_parenthesized_running_number_is_concrete_episode_identity(self) -> None:
+        info = normalize_filename("Japanese amateur leak (12)_mkv_hd720.mp4")
+        self.assertEqual(info.identity_kind, "series_episode")
+        self.assertEqual(info.series_key, "japaneseamateurleak")
+        self.assertEqual(info.episode_id, "e012")
+
+    def test_long_catalog_title_keeps_final_numeric_segment(self) -> None:
+        info = normalize_filename(
+            "RVR-15 long descriptive title with many words_4.mp4"
+        )
+        self.assertEqual(info.catalog_key, "rvr-15")
+        self.assertEqual(info.part_marker, "part4")
+
+    def test_generic_dvd_name_uses_meaningful_parent_folder(self) -> None:
+        root = Path("X:/library")
+        path = root / "STARS-140" / "VIDEO_TS" / "VTS_01_1.VOB"
+        info = normalize_path(path, root)
+        self.assertEqual(info.catalog_key, "stars-140")
+        self.assertEqual(info.cleaned_display, "STARS-140")
+        self.assertEqual(info.part_marker, "disc:vts01-01")
+        self.assertEqual(info.identity_source, "上级影片目录")
+
+    def test_generic_dvd_name_without_work_folder_is_not_matchable(self) -> None:
+        root = Path("X:/")
+        info = normalize_path(root / "VIDEO_TS" / "VTS_01_1.VOB", root)
+        self.assertEqual(info.primary, "")
+        self.assertEqual(info.identity_kind, "generic_media")
 
 
 if __name__ == "__main__":

@@ -10,11 +10,15 @@ from media_dup_finder.app import (
     MediaDupFinderApp,
     build_file_information,
     build_report_row,
+    content_relation_label,
+    format_scan_filter_summary,
     format_matching_progress_text,
+    normalize_column_order,
     sort_records_for_display,
 )
 from media_dup_finder.matching import MatchingProgressState
 from media_dup_finder.models import DuplicateGroup, FileRecord
+from media_dup_finder.models import ScanStatistics
 from media_dup_finder.normalization import normalize_stem
 
 
@@ -60,6 +64,42 @@ class ApplicationBehaviorTests(unittest.TestCase):
         source = inspect.getsource(MediaDupFinderApp.start_scan)
         self.assertNotIn("hash_confirmation", source)
         self.assertNotIn("askyesnocancel", source)
+
+    def test_filter_summary_explains_why_files_were_skipped(self) -> None:
+        statistics = ScanStatistics(
+            skipped_too_small=12,
+            skipped_too_large=4,
+            skipped_hidden_system_files=3,
+            skipped_excluded_directories=2,
+            skipped_keyword=2,
+        )
+        text = format_scan_filter_summary(statistics)
+        self.assertIn("小文件 12", text)
+        self.assertIn("超大文件 4", text)
+        self.assertIn("隐藏/系统文件 3", text)
+        self.assertIn("排除目录 2", text)
+        self.assertIn("关键字排除 2", text)
+
+    def test_saved_column_order_is_validated_and_completed(self) -> None:
+        self.assertEqual(
+            normalize_column_order(
+                ["size", "name", "size", "removed"],
+                ("name", "size", "duration"),
+            ),
+            ["size", "name", "duration"],
+        )
+
+    def test_content_relation_exposes_exact_md5_subset(self) -> None:
+        folder = Path(tempfile.gettempdir()) / "media-dup-relation-tests"
+        records = [
+            FileRecord(folder / name, folder, 100, 1.0, normalize_stem(Path(name).stem))
+            for name in ("one.mp4", "two.mkv", "three.mov")
+        ]
+        records[0].content_md5 = records[1].content_md5 = "a" * 32
+        records[2].content_md5 = "b" * 32
+        group = DuplicateGroup("g", records, 1.0, "test", match_kind="mixed")
+        self.assertIn("MD5相同 ×2", content_relation_label(records[0], group))
+        self.assertIn("组内不同", content_relation_label(records[2], group))
 
     def test_complete_file_information_contains_operational_details(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
