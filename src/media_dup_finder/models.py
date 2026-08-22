@@ -36,6 +36,7 @@ class FileRecord:
     content_md5: Optional[str] = None
     hash_source: str = "未计算"
     action: str = "未决定"
+    snapshot_time_precision: str = "exact"
     file_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -93,6 +94,7 @@ class DuplicateGroup:
     match_kind: str = "name"
     metadata_note: str = ""
     safety_warning: bool = False
+    display_name_override: str = ""
 
     @property
     def total_size(self) -> int:
@@ -117,6 +119,8 @@ class DuplicateGroup:
 
     @property
     def display_name(self) -> str:
+        if self.display_name_override.strip():
+            return self.display_name_override.strip()
         for item in self.files:
             if item.name_info.catalog_key:
                 return item.name_info.catalog_key.upper()

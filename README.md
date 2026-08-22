@@ -64,6 +64,9 @@
 - 删除前二次确认；不提供静默永久删除，Windows 下默认进入回收站
 - 阻止把同一候选组全部标记删除
 - 导出带 BOM 的 CSV 报告，可直接用 Excel 打开
+- 可直接导入 v1.7.0 导出的 CSV，恢复数百个“保留 / 删除 / 未决定”标记，无需重新扫描或逐个重做选择
+- 执行删除时逐文件校验；已移动、修改、删除或不再安全的项目自动标为“忽略”，其余有效标记继续执行
+- 自动生成带原因、原路径、扫描快照和当前状态的忽略清单；若保留文件已经失效，则让用户选择仅本组继续、本次全部继续、安全忽略本组或取消操作
 - 后台扫描和停止按钮；目录扫描、作品身份比较和候选整理阶段均可停止
 - 自动保存窗口、目录和扫描偏好；记录回收站操作历史
 - GitHub Actions 自动构建 Windows x64 与 x86 发布包
@@ -77,6 +80,8 @@
 3. 双击 `MediaDupFinder.exe`。
 4. 批量选择一个或多个磁盘/目录并开始扫描。
 5. 逐组检查，设置保留和删除，再执行回收站操作。
+
+如果已经在 v1.7.0 中完成大量标记，可在新版本点击“导入旧报告”，直接载入原 CSV 后继续执行，不需要重新扫描或重新标记。
 
 > Windows 7 必须是 SP1。极精简或长期未更新的 Windows 7 可能缺少 Universal C Runtime，此时需要先安装微软 Visual C++ 2015–2022 Redistributable 或相应系统更新。Windows 10/11 通常已具备所需运行组件。
 
@@ -113,7 +118,7 @@ Windows 上安装 Python 3.8 后，双击 `build_windows.bat`。脚本会自动�
 
 ```text
 dist\MediaDupFinder.exe
-release\MediaDupFinder-v1.7.0-Windows-x64.zip
+release\MediaDupFinder-v1.8.0-Windows-x64.zip
 ```
 
 PyInstaller 不是交叉编译器，因此 Windows EXE 必须在 Windows 或 GitHub 的 Windows Runner 上生成。完整说明见 [Windows 构建与发布](docs/WINDOWS_BUILD.md)。
@@ -125,13 +130,13 @@ PyInstaller 不是交叉编译器，因此 Windows EXE 必须在 Windows 或 Git
 1. 把整个项目推送到 GitHub 的 `main` 分支。
 2. 打开仓库的 **Actions** 页面，可手动运行 **Build Windows releases**。
 3. 每次推送都会生成 x64、x86 两个可下载的工作流产物。
-4. 创建并推送 `v1.7.0` 标签时，工作流还会自动创建 GitHub Release 并附上两个 ZIP。
+4. 创建并推送 `v1.8.0` 标签时，工作流还会自动创建 GitHub Release 并附上两个 ZIP。
 
 示例命令：
 
 ```bash
-git tag v1.7.0
-git push origin v1.7.0
+git tag v1.8.0
+git push origin v1.8.0
 ```
 
 ## 识别逻辑概览
@@ -158,6 +163,8 @@ git push origin v1.7.0
 - 为避免网络共享文件被不可恢复删除，UNC 网络路径会被拒绝。
 - 不跟随符号链接，也不处理目录。
 - MD5 期间会检测文件变化；缓存复用前也会重新验证快速指纹，删除前再次检查大小和修改时间。
+- 删除校验按文件独立执行，一个文件状态变化不会再中止整批操作；异常项目自动忽略并写入 CSV 清单。
+- 如果某个候选组已经找不到状态正常的保留文件，软件会明确列出异常并询问；默认安全选项是忽略本组，也可由用户确认仅本组或本次后续同类情况继续执行。
 - 片长差异较大的文件不会被“智能选择”自动标记删除。
 - 软件完全本地运行，不上传文件名、路径或媒体内容。
 

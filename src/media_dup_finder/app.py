@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -43,7 +44,17 @@ from .models import (
     ScanStatistics,
     VIDEO_EXTENSIONS,
 )
-from .operations import DeletionResult, send_to_recycle_bin
+from .operations import (
+    DeletionCandidate,
+    DeletionResult,
+    OperationItem,
+    classify_deletion_candidates,
+    ignored_candidate,
+    inspect_deletion_candidate,
+    send_checked_deletion_candidates,
+    write_ignored_report,
+)
+from .report_io import ReportImportError, load_report
 from .scan_filters import (
     SCOPE_ALL,
     SCOPE_DIFFERENT_FOLDER,
@@ -125,6 +136,96 @@ def content_relation_label(record: FileRecord, group: DuplicateGroup) -> str:
     if record.hash_source == "快速指纹不同，跳过完整 MD5":
         return "快速指纹不同"
     return "作品身份相似（内容未确认）"
+
+
+def deletion_candidate_for_record(
+    record: FileRecord,
+    group: DuplicateGroup,
+) -> DeletionCandidate:
+    return DeletionCandidate(
+        path=record.path,
+        expected_size=record.size,
+        expected_modified_time=record.modified_time,
+        time_precision=record.snapshot_time_precision,
+        group_name=group.display_name,
+    )
+
+
+@dataclass
+class SurvivorConflict:
+    group: DuplicateGroup
+    delete_candidates: List[DeletionCandidate]
+    survivor_issues: List[OperationItem]
+
+
+def analyze_deletion_plan(
+    groups: Sequence[DuplicateGroup],
+) -> Tuple[List[DeletionCandidate], List[OperationItem], List[SurvivorConflict]]:
+    """Separate valid deletions, stale targets and groups whose survivor changed."""
+
+    ready: List[DeletionCandidate] = []
+    ignored: List[OperationItem] = []
+    conflicts: List[SurvivorConflict] = []
+    for group in groups:
+        marked = [record for record in group.files if record.action == "删除"]
+        if not marked:
+            continue
+        marked_candidates = [
+            deletion_candidate_for_record(record, group) for record in marked
+        ]
+        group_ready, group_ignored = classify_deletion_candidates(marked_candidates)
+        ignored.extend(group_ignored)
+        if not group_ready:
+            continue
+
+        survivor_candidates = [
+            deletion_candidate_for_record(record, group)
+            for record in group.files
+            if record.action != "删除"
+        ]
+        if not survivor_candidates:
+            ignored.extend(
+                ignored_candidate(
+                    candidate,
+                    "候选组没有保留或未删除文件，为防止整组被删除已自动忽略",
+                )
+                for candidate in group_ready
+            )
+            continue
+
+        survivor_issues: List[OperationItem] = []
+        has_current_survivor = False
+        for candidate in survivor_candidates:
+            issue = inspect_deletion_candidate(candidate)
+            if issue is None:
+                has_current_survivor = True
+            else:
+                issue.preserve_action = True
+                issue.message = "原保留/非删除文件状态异常：{}".format(issue.message)
+                survivor_issues.append(issue)
+        if has_current_survivor:
+            ready.extend(group_ready)
+        else:
+            conflicts.append(SurvivorConflict(group, group_ready, survivor_issues))
+    return ready, ignored, conflicts
+
+
+def build_safe_deletion_plan(
+    groups: Sequence[DuplicateGroup],
+) -> Tuple[List[DeletionCandidate], List[OperationItem]]:
+    """Conservative non-interactive plan used by tests and headless callers."""
+
+    ready, ignored, conflicts = analyze_deletion_plan(groups)
+    for conflict in conflicts:
+        ignored.extend(conflict.survivor_issues)
+        ignored.extend(
+            ignored_candidate(
+                candidate,
+                "候选组中没有状态正常的保留文件，为防止整组被删除已自动忽略",
+            )
+            for candidate in conflict.delete_candidates
+        )
+    return ready, ignored
 
 
 def format_matching_progress_text(state: MatchingProgressState) -> str:
@@ -225,7 +326,7 @@ def sort_records_for_display(
 ) -> List[FileRecord]:
     """Sort known values while always leaving unknown metadata at the end."""
 
-    action_order = {"未决定": 0, "保留": 1, "删除": 2}
+    action_order = {"未决定": 0, "保留": 1, "删除": 2, "忽略": 3}
 
     def value(record: FileRecord) -> object:
         height = record.height or record.guessed_height
@@ -301,9 +402,14 @@ def build_file_information(record: FileRecord, group: DuplicateGroup) -> str:
 
     try:
         current_stat = record.path.stat()
+        time_matches = (
+            int(current_stat.st_mtime) == int(record.modified_time)
+            if record.snapshot_time_precision == "seconds"
+            else current_stat.st_mtime == record.modified_time
+        )
         unchanged = (
             current_stat.st_size == record.size
-            and current_stat.st_mtime == record.modified_time
+            and time_matches
         )
         current_state = "正常（与扫描时一致）" if unchanged else "扫描后已发生变化"
         created = _timestamp_text(current_stat.st_ctime)
@@ -388,7 +494,7 @@ REPORT_COLUMNS = (
     "置信度", "决定", "文件名", "识别作品", "身份类型", "身份来源", "来源文本", "作品身份键",
     "作品编号", "分段标记", "系列名称键", "单集日期", "季集编号",
     "完整路径", "所在目录", "大小(字节)", "MD5", "MD5状态", "内容关系", "分辨率",
-    "时长(秒)", "编码", "格式", "修改时间",
+    "时长(秒)", "编码", "格式", "修改时间", "扫描快照时间戳", "报告版本",
 )
 
 
@@ -429,6 +535,11 @@ def build_report_row(
         record.codec or "",
         record.extension.lstrip(".").upper(),
         datetime.fromtimestamp(record.modified_time).isoformat(timespec="seconds"),
+        (
+            repr(float(record.modified_time))
+            if record.snapshot_time_precision == "exact" else ""
+        ),
+        __version__,
     ]
 
 
@@ -775,6 +886,96 @@ class ColumnOrderDialog:
         return self.result
 
 
+class SurvivorChangedDialog:
+    """Ask how to proceed when every intended survivor in one group changed."""
+
+    def __init__(self, parent: tk.Misc, conflict: SurvivorConflict) -> None:
+        self.result = "cancel"
+        self.window = tk.Toplevel(parent)
+        self.window.title("原保留文件状态已变化")
+        self.window.geometry("760x480")
+        self.window.minsize(680, 420)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        outer = ttk.Frame(self.window, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="候选作品：{}".format(conflict.group.display_name),
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=(
+                "该组原本保留或未标记删除的文件已经丢失、移动或发生变化。"
+                "如果继续，将删除本组其余 {} 个状态正常的已标记文件（{}）。"
+            ).format(
+                len(conflict.delete_candidates),
+                format_bytes(sum(
+                    candidate.expected_size for candidate in conflict.delete_candidates
+                )),
+            ),
+            foreground="#b42318",
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(9, 9))
+
+        details_frame = ttk.LabelFrame(outer, text="发生变化的原保留/非删除文件", padding=7)
+        details_frame.pack(fill="both", expand=True)
+        details = tk.Text(details_frame, height=9, wrap="word")
+        details.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(details_frame, orient="vertical", command=details.yview)
+        scroll.pack(side="right", fill="y")
+        details.configure(yscrollcommand=scroll.set)
+        for issue in conflict.survivor_issues:
+            details.insert(tk.END, "• {}\n  {}\n\n".format(issue.path, issue.message))
+        details.configure(state="disabled")
+
+        ttk.Label(
+            outer,
+            text=(
+                "“仅本组继续”只放行当前组；“本次全部继续”会在本次批处理中"
+                "放行后续所有同类保留文件变动。已标记删除的文件本身若发生变化，"
+                "仍会自动忽略。"
+            ),
+            wraplength=720,
+            justify="left",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(9, 9))
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x")
+        ttk.Button(
+            actions, text="取消整个操作", command=self._cancel,
+        ).pack(side="right")
+        ttk.Button(
+            actions, text="本次全部继续", command=lambda: self._choose("continue_all"),
+        ).pack(side="right", padx=(0, 7))
+        ttk.Button(
+            actions, text="仅本组继续", command=lambda: self._choose("continue"),
+        ).pack(side="right", padx=(0, 7))
+        ttk.Button(
+            actions, text="安全忽略本组", style="Accent.TButton",
+            command=lambda: self._choose("skip"),
+        ).pack(side="left")
+
+    def _choose(self, result: str) -> None:
+        self.result = result
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = "cancel"
+        self.window.destroy()
+
+    def show(self) -> str:
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
+
+
 class MediaDupFinderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -784,6 +985,7 @@ class MediaDupFinderApp:
         self.group_by_id: Dict[str, DuplicateGroup] = {}
         self.file_by_id: Dict[str, FileRecord] = {}
         self.current_group_id: Optional[str] = None
+        self.imported_report_path: Optional[Path] = None
         self.events: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self.cancel_event = threading.Event()
         self.busy = False
@@ -852,6 +1054,8 @@ class MediaDupFinderApp:
         file_menu = tk.Menu(menu, tearoff=False)
         file_menu.add_command(label="批量添加扫描目录…", command=self.add_directory)
         file_menu.add_command(label="管理排除目录…", command=self.manage_excluded_directories)
+        file_menu.add_separator()
+        file_menu.add_command(label="导入 v1.7.0 报告并恢复标记…", command=self.import_report)
         file_menu.add_command(label="导出当前报告…", command=self.export_report)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
@@ -1207,6 +1411,7 @@ class MediaDupFinderApp:
         self.detail_tree.configure(yscrollcommand=detail_y.set, xscrollcommand=detail_x.set)
         self.detail_tree.tag_configure("keep", foreground="#176c35")
         self.detail_tree.tag_configure("delete", foreground="#b42318")
+        self.detail_tree.tag_configure("ignored", foreground="#667085")
         self.detail_tree.tag_configure("pending", foreground="#3e4c59")
         self.detail_tree.bind("<Double-1>", lambda _event: self.open_selected_file())
         self.detail_tree.bind("<Button-3>", self._show_detail_context_menu)
@@ -1247,6 +1452,10 @@ class MediaDupFinderApp:
         self.summary_label = ttk.Label(bottom_actions, text="尚未扫描", style="Status.TLabel")
         self.summary_label.pack(side="left")
         ttk.Button(bottom_actions, text="导出报告…", command=self.export_report).pack(side="right", padx=(6, 0))
+        self.import_report_button = ttk.Button(
+            bottom_actions, text="导入旧报告…", command=self.import_report,
+        )
+        self.import_report_button.pack(side="right", padx=(6, 0))
         ttk.Button(bottom_actions, text="清除选择", command=self.clear_all_actions).pack(side="right")
 
         status = ttk.Frame(outer)
@@ -1267,6 +1476,7 @@ class MediaDupFinderApp:
             self.max_size_entry, self.custom_extensions_entry, self.excluded_button,
             self.skip_hidden_system_check, self.skip_incomplete_check,
             self.exclude_keywords_entry, self.group_columns_button, self.detail_columns_button,
+            self.import_report_button,
         ]
 
     def _restore_settings_to_ui(self) -> None:
@@ -1730,6 +1940,7 @@ class MediaDupFinderApp:
             return
         self.files = result.files
         self.groups = result.groups
+        self.imported_report_path = None
         self.file_by_id = {item.file_id: item for item in self.files}
         self._refresh_group_tree()
         candidate_count = sum(len(group.files) for group in self.groups)
@@ -1877,7 +2088,9 @@ class MediaDupFinderApp:
         )
         for record in ordered_records:
             modified = datetime.fromtimestamp(record.modified_time).strftime("%Y-%m-%d %H:%M")
-            tag = {"保留": "keep", "删除": "delete"}.get(record.action, "pending")
+            tag = {
+                "保留": "keep", "删除": "delete", "忽略": "ignored",
+            }.get(record.action, "pending")
             self.detail_tree.insert(
                 "", tk.END, iid=record.file_id,
                 values=(
@@ -2035,6 +2248,47 @@ class MediaDupFinderApp:
         else:
             self.status_var.set("当前没有已标记删除的文件。")
 
+    def _resolve_survivor_conflicts(
+        self,
+        ready: List[DeletionCandidate],
+        ignored: List[OperationItem],
+        conflicts: Sequence[SurvivorConflict],
+    ) -> Optional[Tuple[List[DeletionCandidate], List[OperationItem]]]:
+        continue_all = False
+        for conflict in conflicts:
+            if continue_all:
+                decision = "continue_all"
+            else:
+                decision = SurvivorChangedDialog(self.root, conflict).show()
+            if decision == "cancel":
+                self.status_var.set("已取消操作，未删除任何文件。")
+                return None
+
+            if decision in {"continue", "continue_all"}:
+                choice_text = (
+                    "用户选择本次后续同类情况全部继续"
+                    if decision == "continue_all" or continue_all
+                    else "用户选择仅本组继续"
+                )
+                for issue in conflict.survivor_issues:
+                    issue.message += "；{}".format(choice_text)
+                ignored.extend(conflict.survivor_issues)
+                ready.extend(conflict.delete_candidates)
+                if decision == "continue_all":
+                    continue_all = True
+            else:
+                for issue in conflict.survivor_issues:
+                    issue.message += "；用户选择安全忽略本组"
+                ignored.extend(conflict.survivor_issues)
+                ignored.extend(
+                    ignored_candidate(
+                        candidate,
+                        "原保留文件状态异常，用户选择安全忽略本组",
+                    )
+                    for candidate in conflict.delete_candidates
+                )
+        return ready, ignored
+
     def execute_deletions(self) -> None:
         if self.busy:
             return
@@ -2042,55 +2296,86 @@ class MediaDupFinderApp:
         if not marked:
             messagebox.showinfo("没有删除标记", "请先选择文件并点击“标记删除”。")
             return
-        for group in self.groups:
-            if group.files and all(record.action == "删除" for record in group.files):
-                messagebox.showwarning(
-                    "已阻止危险操作",
-                    "候选组“{}”中的文件全部被标记删除。请至少取消一个。".format(group.display_name),
-                )
-                return
-        changed = []
-        for record in marked:
-            try:
-                stat = record.path.stat()
-                if stat.st_size != record.size or stat.st_mtime != record.modified_time:
-                    changed.append(record)
-            except OSError:
-                changed.append(record)
-        if changed:
-            messagebox.showerror(
-                "文件状态已变化",
-                "有 {} 个文件在扫描后被移动、修改或删除，请重新扫描后再操作。".format(len(changed)),
+        ready, preflight_ignored, conflicts = analyze_deletion_plan(self.groups)
+        resolved = self._resolve_survivor_conflicts(
+            ready, preflight_ignored, conflicts,
+        )
+        if resolved is None:
+            return
+        ready, preflight_ignored = resolved
+        source_report = self.imported_report_path
+        preferred_directory = source_report.parent if source_report else None
+        if not ready:
+            result = send_checked_deletion_candidates(
+                [], initial_ignored=preflight_ignored,
             )
+            try:
+                result.ignore_report_path = write_ignored_report(
+                    result.ignored,
+                    preferred_directory=preferred_directory,
+                    source_report=source_report,
+                )
+            except OSError as exc:
+                result.ignore_report_error = str(exc)
+            self._handle_delete_done(result)
             return
 
-        total = sum(record.size for record in marked)
+        total = sum(candidate.expected_size for candidate in ready)
+        ready_paths = {
+            os.path.normcase(os.path.abspath(str(candidate.path)))
+            for candidate in ready
+        }
         warning_groups = sum(
-            group.safety_warning and any(record.action == "删除" for record in group.files)
+            group.safety_warning and any(
+                record.action == "删除"
+                and os.path.normcase(os.path.abspath(str(record.path))) in ready_paths
+                for record in group.files
+            )
             for group in self.groups
         )
-        preview_names = "\n".join("• {}".format(record.path.name) for record in marked[:8])
-        if len(marked) > 8:
-            preview_names += "\n• ……另有 {} 个文件".format(len(marked) - 8)
+        preview_names = "\n".join(
+            "• {}".format(candidate.path.name) for candidate in ready[:8]
+        )
+        if len(ready) > 8:
+            preview_names += "\n• ……另有 {} 个文件".format(len(ready) - 8)
+        ignored_notice = ""
+        if preflight_ignored:
+            ignored_notice = (
+                "\n\n安全检查发现 {} 个文件状态已变化或缺少有效保留文件："
+                "这些文件将自动忽略并写入清单，不会阻断其他操作。"
+                .format(len(preflight_ignored))
+            )
         confirmed = messagebox.askyesno(
             "确认移入回收站",
             "即将把 {} 个文件（{}）移入 Windows 回收站：\n\n{}\n\n"
-            "{}请确认已逐组检查。是否继续？".format(
-                len(marked), format_bytes(total), preview_names,
+            "{}请确认已逐组检查。是否继续？{}".format(
+                len(ready), format_bytes(total), preview_names,
                 "其中 {} 个候选组存在片长差异，请重点确认。\n\n".format(warning_groups)
                 if warning_groups else "",
+                ignored_notice,
             ),
         )
         if not confirmed:
             return
 
-        paths = [record.path for record in marked]
         self._set_busy(True, "delete")
-        self.status_var.set("正在移入回收站，请勿关闭程序…")
+        self.status_var.set(
+            "正在逐文件安全校验并移入回收站；异常文件会自动忽略，请勿关闭程序…"
+        )
 
         def worker() -> None:
             try:
-                result = send_to_recycle_bin(paths)
+                result = send_checked_deletion_candidates(
+                    ready, initial_ignored=preflight_ignored,
+                )
+                try:
+                    result.ignore_report_path = write_ignored_report(
+                        result.ignored,
+                        preferred_directory=preferred_directory,
+                        source_report=source_report,
+                    )
+                except OSError as exc:
+                    result.ignore_report_error = str(exc)
                 self.events.put(("delete_done", result))
             except Exception as exc:
                 self.events.put(("error", (str(exc), traceback.format_exc())))
@@ -2107,12 +2392,20 @@ class MediaDupFinderApp:
             os.path.normcase(os.path.abspath(str(item.path)))
             for item in result.failed
         }
+        ignored_paths = {
+            os.path.normcase(os.path.abspath(str(item.path)))
+            for item in result.ignored
+            if not item.preserve_action
+        }
         self.files = [
             record for record in self.files
             if os.path.normcase(os.path.abspath(str(record.path))) not in succeeded_paths
         ]
         for record in self.files:
-            if os.path.normcase(os.path.abspath(str(record.path))) in failed_paths:
+            identity = os.path.normcase(os.path.abspath(str(record.path)))
+            if identity in ignored_paths:
+                record.action = "忽略"
+            elif identity in failed_paths:
                 record.action = "未决定"
 
         retained_groups = []
@@ -2127,14 +2420,35 @@ class MediaDupFinderApp:
         self.file_by_id = {record.file_id: record for record in self.files}
         self._refresh_group_tree()
 
+        ignored_details = "\n".join(
+            "{}：{}".format(item.path.name, item.message) for item in result.ignored[:8]
+        )
+        report_text = (
+            "\n\n忽略清单：{}".format(result.ignore_report_path)
+            if result.ignore_report_path else ""
+        )
+        report_error = (
+            "\n\n注意：{}".format(result.ignore_report_error)
+            if result.ignore_report_error else ""
+        )
         if result.failed:
             details = "\n".join(
                 "{}：{}".format(item.path.name, item.message) for item in result.failed[:8]
             )
             messagebox.showwarning(
                 "部分文件未处理",
-                "成功移入回收站 {} 个，失败 {} 个。\n\n{}".format(
-                    len(result.succeeded), len(result.failed), details
+                "成功移入回收站 {} 个，自动忽略 {} 个，操作失败 {} 个。\n\n{}{}{}"
+                .format(
+                    len(result.succeeded), len(result.ignored), len(result.failed),
+                    details, report_text, report_error,
+                ),
+            )
+        elif result.ignored:
+            messagebox.showinfo(
+                "操作完成（已自动忽略异常文件）",
+                "成功移入回收站 {} 个，自动忽略 {} 个。\n\n{}{}{}".format(
+                    len(result.succeeded), len(result.ignored), ignored_details,
+                    report_text, report_error,
                 ),
             )
         else:
@@ -2145,8 +2459,9 @@ class MediaDupFinderApp:
                 ),
             )
         self.status_var.set(
-            "回收站操作完成：成功 {} 个，失败 {} 个。".format(
-                len(result.succeeded), len(result.failed)
+            "回收站操作完成：成功 {} 个，自动忽略 {} 个，失败 {} 个。{}".format(
+                len(result.succeeded), len(result.ignored), len(result.failed),
+                "忽略清单已生成。" if result.ignore_report_path else "",
             )
         )
 
@@ -2283,6 +2598,75 @@ class MediaDupFinderApp:
         except OSError as exc:
             messagebox.showerror("无法打开", "无法打开文件位置：{}".format(exc))
 
+    def import_report(self) -> None:
+        if self.busy:
+            return
+        target = filedialog.askopenfilename(
+            title="导入 MediaDupFinder 扫描报告",
+            filetypes=(
+                ("MediaDupFinder CSV 报告", "*.csv"),
+                ("所有文件", "*.*"),
+            ),
+        )
+        if not target:
+            return
+        if self.groups and not messagebox.askyesno(
+            "替换当前结果",
+            "导入报告会替换当前扫描结果，但不会立即删除任何文件。\n\n"
+            "报告中的“保留 / 删除 / 未决定”标记将被完整恢复。是否继续？",
+        ):
+            return
+        try:
+            imported = load_report(Path(target))
+        except ReportImportError as exc:
+            messagebox.showerror("报告无法导入", str(exc))
+            return
+        except (OSError, csv.Error) as exc:
+            messagebox.showerror("报告无法导入", "读取报告时发生错误：{}".format(exc))
+            return
+
+        self.files = imported.files
+        self.groups = imported.groups
+        self.imported_report_path = imported.source_path
+        self.file_by_id = {record.file_id: record for record in self.files}
+        self._refresh_group_tree()
+        keep_count = sum(record.action == "保留" for record in self.files)
+        ignored_count = sum(record.action == "忽略" for record in self.files)
+        self.summary_label.configure(text=(
+            "已导入报告 · {} 组 / {} 个文件 · 删除标记 {} 个 · 保留 {} 个{}"
+            .format(
+                len(self.groups), len(self.files), imported.marked_delete_count,
+                keep_count,
+                " · 已忽略 {} 个".format(ignored_count) if ignored_count else "",
+            )
+        ))
+        self.status_var.set(
+            "已从 {} 报告恢复全部标记；执行时异常文件将自动忽略，其余文件继续处理。"
+            .format(imported.report_version)
+        )
+        if imported.warnings:
+            details = "\n".join(imported.warnings[:8])
+            if len(imported.warnings) > 8:
+                details += "\n……另有 {} 条".format(len(imported.warnings) - 8)
+            messagebox.showwarning(
+                "报告已导入（有部分提示）",
+                "已恢复 {} 个删除标记；有 {} 行无法完整恢复：\n\n{}".format(
+                    imported.marked_delete_count, len(imported.warnings), details,
+                ),
+            )
+        elif imported.marked_delete_count:
+            messagebox.showinfo(
+                "报告导入完成",
+                "已恢复 {} 个删除标记，不需要重新逐个标记。\n\n"
+                "点击“执行已标记删除”后，状态变化的文件会自动进入忽略清单。"
+                .format(imported.marked_delete_count),
+            )
+        else:
+            messagebox.showwarning(
+                "报告中没有删除标记",
+                "报告已经导入，但“决定”列中没有找到“删除”标记。",
+            )
+
     def export_report(self) -> None:
         if not self.groups:
             messagebox.showinfo("没有可导出的结果", "请先完成扫描并找到候选组。")
@@ -2316,7 +2700,8 @@ class MediaDupFinderApp:
             "5. 点击两侧的“列顺序”可把全部列向左或向右移动，设置会自动保存。\n"
             "6. 在文件行上右键，可查看完整信息、打开文件、定位目录或复制路径。\n"
             "7. 手工设置保留/删除，或使用智能选择后再复核。\n"
-            "8. 点击“执行已标记删除”，文件默认进入 Windows 回收站。\n\n"
+            "8. 已在 v1.7.0 完成大量标记时，可点击“导入旧报告”直接恢复，不需要重新扫描或标记。\n"
+            "9. 点击“执行已标记删除”，状态正常的文件进入回收站；已移动、修改或删除的项目自动忽略并生成清单。\n\n"
             "识别示例：\n"
             "MIDA-630、MIDA-630-C、MIDA-630-4K 会归为同组；\n"
             "寒战、寒战1、经典剧情《寒战1》会作为候选同组。\n\n"
@@ -2326,7 +2711,8 @@ class MediaDupFinderApp:
             "还支持网站前缀、繁简体、年份、罗马数字、发布组标签与 MD5 完全重复。\n"
             "MD5 可选关闭、智能、完整三档；智能模式先读三段快速指纹，只有相同时才完整读取。\n"
             "MD5 模式在开始扫描前确定，运行中不会再弹窗等待确认；已验证缓存可减少重复读取。\n\n"
-            "安全提示：不同年份、日期、季集或分段不会自动合并；片长差异超过安全范围时禁止智能批量删除。",
+            "安全提示：不同年份、日期、季集或分段不会自动合并；片长差异超过安全范围时禁止智能批量删除。\n"
+            "如果原定保留文件已经失效，软件会询问仅本组继续、本次全部继续、安全忽略本组或取消操作。",
         )
 
     def show_about(self) -> None:

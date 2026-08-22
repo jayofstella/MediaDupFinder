@@ -4,10 +4,13 @@ import inspect
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from media_dup_finder.app import (
     REPORT_COLUMNS,
     MediaDupFinderApp,
+    analyze_deletion_plan,
+    build_safe_deletion_plan,
     build_file_information,
     build_report_row,
     content_relation_label,
@@ -137,6 +140,83 @@ class ApplicationBehaviorTests(unittest.TestCase):
             self.assertEqual(row[REPORT_COLUMNS.index("识别作品")], "MIDA-630")
             self.assertEqual(row[REPORT_COLUMNS.index("身份类型")], "作品编号")
             self.assertEqual(row[REPORT_COLUMNS.index("编码")], "hevc")
+
+            record.snapshot_time_precision = "seconds"
+            imported_row = build_report_row(1, group, record)
+            self.assertEqual(
+                imported_row[REPORT_COLUMNS.index("扫描快照时间戳")], "",
+            )
+
+    def test_missing_or_changed_keep_file_protects_the_rest_of_its_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            keep_path = folder / "MIDA-630-4K.mp4"
+            delete_path = folder / "MIDA-630-rm.mp4"
+            keep_path.write_bytes(b"keep")
+            delete_path.write_bytes(b"delete")
+            keep_stat = keep_path.stat()
+            delete_stat = delete_path.stat()
+            keep = FileRecord(
+                keep_path, folder, keep_stat.st_size, keep_stat.st_mtime,
+                normalize_stem(keep_path.stem), action="保留",
+            )
+            delete = FileRecord(
+                delete_path, folder, delete_stat.st_size, delete_stat.st_mtime,
+                normalize_stem(delete_path.stem), action="删除",
+            )
+            group = DuplicateGroup("g", [keep, delete], 1.0, "test")
+            keep_path.unlink()
+
+            ready, ignored = build_safe_deletion_plan([group])
+
+            self.assertEqual(ready, [])
+            self.assertEqual(len(ignored), 2)
+            delete_issue = next(item for item in ignored if item.path == delete_path)
+            self.assertIn("没有状态正常的保留文件", delete_issue.message)
+            keep_issue = next(item for item in ignored if item.path == keep_path)
+            self.assertTrue(keep_issue.preserve_action)
+            self.assertTrue(delete_path.exists())
+
+    def test_continue_all_survivor_choice_applies_to_following_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            groups = []
+            for number in (1, 2):
+                keep_path = folder / "keep-{}.mp4".format(number)
+                delete_path = folder / "delete-{}.mp4".format(number)
+                keep_path.write_bytes(b"keep")
+                delete_path.write_bytes(b"delete")
+                keep_stat = keep_path.stat()
+                delete_stat = delete_path.stat()
+                keep = FileRecord(
+                    keep_path, folder, keep_stat.st_size, keep_stat.st_mtime,
+                    normalize_stem(keep_path.stem), action="保留",
+                )
+                delete = FileRecord(
+                    delete_path, folder, delete_stat.st_size, delete_stat.st_mtime,
+                    normalize_stem(delete_path.stem), action="删除",
+                )
+                groups.append(DuplicateGroup(
+                    "g{}".format(number), [keep, delete], 1.0, "test",
+                    display_name_override="作品 {}".format(number),
+                ))
+                keep_path.unlink()
+
+            ready, ignored, conflicts = analyze_deletion_plan(groups)
+            app = MediaDupFinderApp.__new__(MediaDupFinderApp)
+            app.root = None
+            with patch("media_dup_finder.app.SurvivorChangedDialog") as dialog:
+                dialog.return_value.show.return_value = "continue_all"
+                resolved = app._resolve_survivor_conflicts(
+                    ready, ignored, conflicts,
+                )
+
+            self.assertIsNotNone(resolved)
+            resolved_ready, resolved_ignored = resolved
+            self.assertEqual(len(resolved_ready), 2)
+            self.assertEqual(len(resolved_ignored), 2)
+            self.assertTrue(all(item.preserve_action for item in resolved_ignored))
+            self.assertEqual(dialog.call_count, 1)
 
 
 if __name__ == "__main__":
